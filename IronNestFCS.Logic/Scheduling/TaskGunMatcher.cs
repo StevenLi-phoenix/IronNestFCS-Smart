@@ -92,6 +92,13 @@ internal static class TaskGunMatcher
         if (a.Count != b.Count)
             return b.Count.CompareTo(a.Count);
 
+        // Explicit task priority (e.g. counter-battery) outranks everything except slot fill: an urgent
+        // task must win its gun even when that spends scarce charge/range capability. Ordinary tasks all
+        // share the default priority, which keeps this comparison neutral for the existing cost model.
+        var explicitPriority = CompareExplicitPriority(a, b);
+        if (explicitPriority != 0)
+            return explicitPriority;
+
         // Narrow single-task exception: when the same task can use either an already-loaded gun or a completely
         // empty gun, consume the compatible LoadedReady round instead of starting a redundant fresh load.
         // This never participates in multi-task set selection, so the existing charge/range protection is intact.
@@ -184,6 +191,24 @@ internal static class TaskGunMatcher
         return candidate.EtaKnown
                && !candidate.LoadAlreadyRunning
                && candidate.LoadSeconds == FireReadyEstimator.FreshLoadReadySeconds;
+    }
+
+    // Negative means a is better. Compares descending priority vectors lexicographically, so the
+    // solution whose best task is more urgent wins; ties fall through to the resource cost model.
+    private static int CompareExplicitPriority(
+        IReadOnlyList<TaskGunAssignment> a,
+        IReadOnlyList<TaskGunAssignment> b)
+    {
+        var aPriorities = a.Select(x => x.Planning.Task.priority).OrderByDescending(x => x).ToArray();
+        var bPriorities = b.Select(x => x.Planning.Task.priority).OrderByDescending(x => x).ToArray();
+
+        for (var i = 0; i < aPriorities.Length && i < bPriorities.Length; i++)
+        {
+            if (aPriorities[i] != bPriorities[i])
+                return bPriorities[i].CompareTo(aPriorities[i]);
+        }
+
+        return 0;
     }
 
     private static int CompareTaskPriority(

@@ -25,6 +25,13 @@ public enum PendingHint {
 
 public class ArtilleryTask {
     public int targetId;
+
+    /// <summary>
+    /// Scheduling priority (0-100, default 50). Higher wins gun assignment before charge-resource
+    /// protection; >= 90 (e.g. counter-battery) also skips the match coalesce window. Set by the
+    /// caller before EnqueueTask; not reset on enqueue.
+    /// </summary>
+    public int priority = 50;
     public float angel;
     public float distance;
     public Vector3 position;
