@@ -41,7 +41,15 @@ internal sealed class FirePriorityCoordinator
         FirePlan second;
         string reason;
 
-        if (a.EtaKnown && b.EtaKnown)
+        if (a.Task.priority != b.Task.priority)
+        {
+            // Explicit task priority (counter-battery etc.) decides the firing order outright;
+            // ETA/alignment only break ties between equal-priority plans.
+            first = a.Task.priority > b.Task.priority ? a : b;
+            second = ReferenceEquals(first, a) ? b : a;
+            reason = $"priority P{first.Task.priority} over P{second.Task.priority}";
+        }
+        else if (a.EtaKnown && b.EtaKnown)
         {
             // Neither unpaired plan owns shared azimuth yet. Evaluate both from the same comparison instant,
             // while preserving each plan's fixed planning-snapshot azimuth distance and local-ready estimate.
