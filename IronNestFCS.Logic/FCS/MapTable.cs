@@ -228,12 +228,16 @@ public class MapTable {
     /// <summary>
     /// Extrapolate the aim point to the predicted impact time: now + prep + flight.
     /// Lead displacement is capped and the result clamped to the map envelope.
+    /// prepSeconds = the remaining delay before the shot leaves: the full prep estimate
+    /// while queued, a short residual during pre-fire/manual-wait corrections.
     /// </summary>
-    public void ApplyMotionModel(ArtilleryTask task) {
+    public void ApplyMotionModel(ArtilleryTask task) => ApplyMotionModel(task, TrackPrepSeconds);
+
+    public void ApplyMotionModel(ArtilleryTask task, float prepSeconds) {
         if (!task.hasMotion || !task.hasAimPoint)
             return;
         var flightSeconds = task.distance > 0.1f ? task.distance / ShellSpeedKmPerSec : 30f;
-        var horizon = MissionNow - task.motionT0 + TrackPrepSeconds + flightSeconds;
+        var horizon = MissionNow - task.motionT0 + prepSeconds + flightSeconds;
         var lead = task.motionVelLocalPerSec * horizon;
         lead.z = 0;
         if (lead.magnitude > MaxLeadLocalUnits)
