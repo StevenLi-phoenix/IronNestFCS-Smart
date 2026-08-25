@@ -269,6 +269,38 @@ public class MapTable {
         task.position = refreshed.position;
     }
 
+    /// <summary>
+    /// LLM-initiated last-minute re-aim: repoint an existing task at a new static map-local
+    /// point. Execution never waits for this — the executor's pre-aim/pre-fire/manual-wait
+    /// refresh stages pick the new point up on their next pass (aimAdjusted widens their
+    /// gate to static tasks). Clears any motion model: an adjustment is an explicit static
+    /// override. A task already on a gun keeps its loaded charge, so a new distance beyond
+    /// that charge's reach is rejected (cancel + requeue is the correct path there).
+    /// </summary>
+    public string AdjustAim(ArtilleryTask task, float localX, float localY, bool onGun) {
+        if (mapSurface == null)
+            return "map surface unbound";
+        var aim = new Vector3(
+            Mathf.Clamp(localX, MapLocalMinX, MapLocalMaxX),
+            Mathf.Clamp(localY, MapLocalMinY, MapLocalMaxY),
+            task.aimLocal.z);
+        if (onGun && task.chargeCount > 0) {
+            var newDistance = (aim - GetTurretLocalOnMap()).magnitude * 3.8164f;
+            var maxRange = task.chargeCount * 5f;
+            if (newDistance > maxRange + 0.01f)
+                return $"rejected: 新距离{newDistance:F2}km超出已装装药C{task.chargeCount}射程{maxRange:F1}km — 该任务装药已固定, 需cancel后重排";
+        }
+        task.trackEntityId = "";
+        task.hasMotion = false;
+        task.trackingLost = false;
+        task.hasAimPoint = true;
+        task.aimLocal = aim;
+        task.aimAdjusted = true;
+        RefreshSolution(task);
+        MelonLogger.Msg($"[FCS] T{task.targetId} aim adjusted by agent -> brg {task.angel:F1}deg, {task.distance:F2}km [{task.progress}]");
+        return $"ok: T{task.targetId} 已改瞄 -> 方位{task.angel:F1}°, 距离{task.distance:F2}km (当前阶段{task.progress})";
+    }
+
     public IEnumerator GetStableMarkTarget(int index, Action<ArtilleryTask?> completed,
         float timeoutSeconds = MarkerStabilizeTimeoutSeconds) {
         if (turretLocation == null || mapSurface == null) {

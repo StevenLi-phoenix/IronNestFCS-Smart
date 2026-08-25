@@ -200,6 +200,24 @@ public class FSC
 
     public string? CancelPendingTask(int targetId) => Dispatcher.CancelPendingByTargetId(targetId);
 
+    /// <summary>
+    /// LLM-initiated aim adjustment on an already-queued or in-preparation task (by T-number).
+    /// Non-blocking by design: execution never waits for adjustments — with no adjustment the
+    /// task fires on its original solution; with one, the staged re-solve pipeline lays the
+    /// new point on its next pass. WaitingForFire under auto-fire may already be too late.
+    /// </summary>
+    public string AdjustTaskAim(int targetId, float localX, float localY)
+    {
+        if (LeftTask is { } lt && lt.targetId == targetId && lt.progress is not (Progress.Finished or Progress.Failed))
+            return MapTable.AdjustAim(lt, localX, localY, onGun: true);
+        if (RightTask is { } rt && rt.targetId == targetId && rt.progress is not (Progress.Finished or Progress.Failed))
+            return MapTable.AdjustAim(rt, localX, localY, onGun: true);
+        foreach (var task in Dispatcher.QueueSnapshot)
+            if (task.targetId == targetId)
+                return MapTable.AdjustAim(task, localX, localY, onGun: false);
+        return $"no adjustable task T{targetId} — 不在等待队列也不在炮位上(已出膛/已完成/已清除)";
+    }
+
     /// <summary>External punchcard purchase (e.g. scout plane): queued into the console coordinator.</summary>
     public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing)
         => RequestConsoleCard(cardId, bearingDeg, hasBearing, 50);
