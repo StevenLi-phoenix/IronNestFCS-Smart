@@ -131,9 +131,23 @@ public class MapTable {
     private const float MapLocalMinY = (-1f - 5.235f) / 3.8164f;
     private const float MapLocalMaxY = (16f - 5.235f) / 3.8164f;
 
-    /// <summary>Mission clock in seconds — same base the bridge stamps on agent events.</summary>
+    /// <summary>
+    /// Game clock in seconds-of-day — the 24h world clock (GenericTimerSceneSync, the same
+    /// clock the telegraph references and the bridge stamps on agent events). Falls back to
+    /// the mission stopwatch, then realtime.
+    /// </summary>
+    private static GenericTimerSceneSync? _worldClock;
     public static float MissionNow {
         get {
+            try {
+                if (_worldClock == null)
+                    foreach (var sync in UnityEngine.Object.FindObjectsOfType<GenericTimerSceneSync>())
+                        if (_worldClock == null || sync.CurrentTime > _worldClock.CurrentTime)
+                            _worldClock = sync;
+                if (_worldClock != null && _worldClock.CurrentTime > 0f)
+                    return _worldClock.CurrentTime;
+            }
+            catch { _worldClock = null; }
             try {
                 var tracker = MissionStatsTracker.Instance;
                 if (tracker != null && tracker.timerRunning)
