@@ -44,31 +44,27 @@ internal sealed class FirePlanExecutor
     }
 
     /// <summary>
-    /// Analytic elevation re-solve. The game's ballistics are LINEAR:
-    /// elevation = distance / maxRange(charge) * 60, with maxRange = charge * 5 km —
-    /// i.e. elevation = distance * 12 / charge, capped at 60°. Calibrating the slope from
-    /// the plan's own console solution (elevation = ref * new/ref distance, a line through
-    /// the origin) reproduces that formula exactly while staying correct for any shell
-    /// whose max range deviates from the 5 km-per-charge pattern.
+    /// The game's exact ballistic model — verified against all 52 logged console solves
+    /// (C1–C6, 2.1–17.9 km, AP/HE): elevation = distance / maxRange(charge) * 60° with
+    /// maxRange = charge * 5 km, i.e. elevation = distance * 12 / charge, capped at 60°.
+    /// Residuals were pure two-decimal odometer rounding (±0.01°), no shell term, no drag.
     /// </summary>
-    private static bool TryAnalyticElevation(
-        float refDistanceKm, float refElevationDeg, float newDistanceKm, out float elevationDeg)
+    public static bool TryAnalyticElevation(int charge, float distanceKm, out float elevationDeg)
     {
         elevationDeg = float.NaN;
-        if (refDistanceKm <= 0.01f || newDistanceKm <= 0.01f || refElevationDeg <= 0.1f)
+        if (charge <= 0 || distanceKm <= 0.01f)
             return false;
-        var candidate = refElevationDeg * (newDistanceKm / refDistanceKm);
-        if (candidate <= 0f || candidate > 60.01f)
+        var candidate = distanceKm * 12f / charge;
+        if (candidate > 60.01f)
             return false; // beyond this charge's reach — let the console (and its error path) decide
         elevationDeg = Mathf.Min(candidate, 60f);
         return true;
     }
 
     /// <summary>Analytic solve first (instant, no lock); physical console as fallback.</summary>
-    private IEnumerator ResolveElevation(
-        FirePlan plan, float refDistanceKm, float refElevationDeg, ElevationSolve result, int lockPriority)
+    private IEnumerator ResolveElevation(FirePlan plan, ElevationSolve result, int lockPriority)
     {
-        if (TryAnalyticElevation(refDistanceKm, refElevationDeg, plan.Task.distance, out var analytic))
+        if (TryAnalyticElevation(plan.Charge, plan.Task.distance, out var analytic))
         {
             result.Ok = true;
             result.Elevation = analytic;
@@ -381,14 +377,12 @@ internal sealed class FirePlanExecutor
         var aimElevation = plan.Elevation;
         if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
         {
-            // The console solved plan.Elevation for THIS distance — the calibration pair.
-            var refDistance = plan.Task.distance;
             if (plan.Task.trackEntityId.Length > 0)
                 _fcs.MapTable.UpdateEntityMotion(plan.Task);
             _fcs.MapTable.ApplyMotionModel(plan.Task, PreAimPrepSeconds);
             _fcs.MapTable.RefreshSolution(plan.Task);
             var aimSolve = new ElevationSolve();
-            yield return ResolveElevation(plan, refDistance, plan.Elevation, aimSolve, plan.Task.priority);
+            yield return ResolveElevation(plan, aimSolve, plan.Task.priority);
             if (!IsActive(plan))
                 yield break;
             if (aimSolve.Ok && Mathf.Abs(aimSolve.Elevation - aimElevation) > TrackElevationEpsilonDegrees)
@@ -495,7 +489,7 @@ internal sealed class FirePlanExecutor
             if (rangeErrorKm > PreFireSignificantErrorKm)
             {
                 var preFireSolve = new ElevationSolve();
-                yield return ResolveElevation(plan, appliedDistance, appliedElevation, preFireSolve, plan.Task.priority);
+                yield return ResolveElevation(plan, preFireSolve, plan.Task.priority);
                 if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
                     yield break;
                 if (preFireSolve.Ok)
@@ -682,7 +676,7 @@ internal sealed class FirePlanExecutor
                     if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
                     {
                         var relaySolve = new ElevationSolve();
-                        yield return ResolveElevation(plan, appliedDistance, appliedElevation, relaySolve, 10);
+                        yield return ResolveElevation(plan, relaySolve, 10);
                         if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
                             yield break;
                         if (relaySolve.Ok)
