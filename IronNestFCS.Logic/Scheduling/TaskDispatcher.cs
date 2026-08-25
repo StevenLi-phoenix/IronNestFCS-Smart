@@ -74,6 +74,15 @@ internal sealed class TaskDispatcher
         // Intent-only queue: no gun/loading read here.
         _taskQueue.Enqueue(task);
         MelonLogger.Msg($"[FCS Dispatch] queued T{task.targetId} P{task.priority}; pending={_taskQueue.Count}");
+
+        // Urgent task with both guns busy: try to hijack a matching-load gun before dispatching.
+        // The preempted task re-enters this queue via EnqueueTask (its priority < urgent, so no recursion).
+        if (task.priority >= UrgentPriorityThreshold && !_fcs.PlanExecutor.HasFreeGun
+            && _fcs.PlanExecutor.TryPreemptForUrgent(task, out var preemptDetail))
+        {
+            MelonLogger.Msg($"[FCS Dispatch] urgent T{task.targetId}: {preemptDetail}");
+        }
+
         TryDispatch();
     }
 
