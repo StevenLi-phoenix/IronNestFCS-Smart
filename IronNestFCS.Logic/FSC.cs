@@ -123,7 +123,7 @@ public class FSC
             TrackCoroutine(SharedResources.ResetFireControlsAfterBind());
             TrackCoroutine(TriggerConsole.ReviewStateLoop());
             TrackCoroutine(SharedResources.ReplenishPowderLoop());
-            TrackCoroutine(SharedResources.ConsoleCardRequestLoop());
+            // Card requests are event-driven: EnqueueCardRequest kicks its own drain coroutine.
         }
 
         return IsBound;

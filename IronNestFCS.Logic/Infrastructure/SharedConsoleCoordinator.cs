@@ -36,6 +36,10 @@ internal sealed class SharedConsoleCoordinator {
         Ballistic.Reset();
         Requisition.Reset();
         Trigger.Reset();
+        // Coroutines were already stopped by FSC.Dispose (their finally cleared _draining);
+        // this is rebind belt-and-braces so a stale flag can never orphan future requests.
+        _cardRequests.Clear();
+        _draining = false;
     }
 
     /// <summary>
@@ -54,11 +58,22 @@ internal sealed class SharedConsoleCoordinator {
     }
 
     private readonly List<ConsoleCardRequest> _cardRequests = new();
+    private bool _draining;
 
     /// <summary>Latest completed card-request outcome, for external observers to poll.</summary>
     public string LastCardRequestResult { get; private set; } = "";
 
-    public void EnqueueCardRequest(ConsoleCardRequest request) => _cardRequests.Add(request);
+    /// <summary>
+    /// Event-driven: the enqueue itself kicks the drain coroutine when none is running —
+    /// no idle polling, no queue-entry latency. External punchcard purchases still execute
+    /// inside the coordinator's own Requisition-lock discipline; no external mod ever
+    /// touches the console directly.
+    /// </summary>
+    public void EnqueueCardRequest(ConsoleCardRequest request) {
+        _cardRequests.Add(request);
+        if (!_draining)
+            _fcs.TrackCoroutine(DrainCardRequests());
+    }
 
     private ConsoleCardRequest? PopHighestPriorityRequest() {
         if (_cardRequests.Count == 0) return null;
@@ -71,33 +86,31 @@ internal sealed class SharedConsoleCoordinator {
         return best;
     }
 
-    /// <summary>
-    /// Drains externally submitted punchcard purchases inside the coordinator's own
-    /// Requisition-lock discipline — no external mod ever touches the console directly.
-    /// </summary>
-    public IEnumerator ConsoleCardRequestLoop() {
-        while (true) {
-            yield return FcsRuntimeClock.WaitForSeconds(1f);
-            if (_cardRequests.Count == 0) continue;
-            yield return FcsRuntimeClock.WaitUntilFocused();
-
-            var request = PopHighestPriorityRequest();
-            if (request == null) continue;
-            MelonLogger.Msg(
-                $"[FCS] console card request: {request.CardId} P{request.Priority}" +
-                (request.BearingDeg is { } b ? $" bearing {b:F1}掳" : ""));
-
-            yield return Requisition.Acquire(request.Priority);
-            try {
+    private IEnumerator DrainCardRequests() {
+        _draining = true;
+        try {
+            // Re-pop per iteration: a P100 arriving mid-drain still jumps the remaining P50s.
+            while (PopHighestPriorityRequest() is { } request) {
                 yield return FcsRuntimeClock.WaitUntilFocused();
-                yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.StartGrid, result => {
-                    LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
-                    MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
-                });
+                MelonLogger.Msg(
+                    $"[FCS] console card request: {request.CardId} P{request.Priority}" +
+                    (request.BearingDeg is { } b ? $" bearing {b:F1}deg" : ""));
+
+                yield return Requisition.Acquire(request.Priority);
+                try {
+                    yield return FcsRuntimeClock.WaitUntilFocused();
+                    yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.StartGrid, result => {
+                        LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
+                        MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
+                    });
+                }
+                finally {
+                    Requisition.Release();
+                }
             }
-            finally {
-                Requisition.Release();
-            }
+        }
+        finally {
+            _draining = false; // also runs when F9 disposes the coroutine mid-purchase
         }
     }
 
