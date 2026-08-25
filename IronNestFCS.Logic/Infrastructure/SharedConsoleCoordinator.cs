@@ -8,6 +8,8 @@ namespace IronNestFCS.Logic.Infrastructure;
 public sealed class ConsoleCardRequest {
     public string CardId = "";
     public float? BearingDeg;
+    /// <summary>Distance in km — MoveDirection-style cards take bearing + distance dials.</summary>
+    public float? DistanceKm;
     /// <summary>Recon start cell like "P4" — drives the console's grid split-flap dials.</summary>
     public string? StartGrid;
     /// <summary>Higher runs first (e.g. 紧急转移 emergency-relocation cards at 100).</summary>
@@ -94,12 +96,13 @@ internal sealed class SharedConsoleCoordinator {
                 yield return FcsRuntimeClock.WaitUntilFocused();
                 MelonLogger.Msg(
                     $"[FCS] console card request: {request.CardId} P{request.Priority}" +
-                    (request.BearingDeg is { } b ? $" bearing {b:F1}deg" : ""));
+                    (request.BearingDeg is { } b ? $" bearing {b:F1}deg" : "") +
+                    (request.DistanceKm is { } d ? $" dist {d:F1}km" : ""));
 
                 yield return Requisition.Acquire(request.Priority);
                 try {
                     yield return FcsRuntimeClock.WaitUntilFocused();
-                    yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.StartGrid, result => {
+                    yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.DistanceKm, request.StartGrid, result => {
                         LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
                         MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
                     });
