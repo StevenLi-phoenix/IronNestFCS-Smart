@@ -121,7 +121,14 @@ internal sealed class TaskDispatcher
         // Late-bound solutions: re-derive every pending task's angel/distance from its
         // fixed aim point and the turret piece's current position before matching.
         foreach (var pending in _taskQueue)
+        {
+            // Moving targets: refit the motion model from the live entity (if tracked),
+            // extrapolate the aim to predicted impact time, THEN re-derive the solution.
+            if (pending.trackEntityId.Length > 0)
+                _fcs.MapTable.UpdateEntityMotion(pending);
+            _fcs.MapTable.ApplyMotionModel(pending);
             _fcs.MapTable.RefreshSolution(pending);
+        }
 
         var snapshot = _fcs.Planner.CaptureSnapshot();
         var attempted = new HashSet<ArtilleryTask>();
