@@ -114,7 +114,30 @@ public class MapTable {
         }
 
         var target = artillery.localPosition - GetTurretLocalOnMap();
-        return BuildMarkTarget(artillery.localPosition, target);
+        var task = BuildMarkTarget(artillery.localPosition, target);
+        task.hasAimPoint = true;
+        task.aimLocal = artillery.localPosition;
+        return task;
+    }
+
+    /// <summary>
+    /// Late-bound solution refresh: recompute angel/distance from the task's fixed aim
+    /// point and the turret piece's CURRENT position. Called each planning round so a
+    /// recalibrated origin corrects every queued task before it reaches a gun.
+    /// </summary>
+    public void RefreshSolution(ArtilleryTask task) {
+        if (!task.hasAimPoint || mapSurface == null)
+            return;
+        var target = task.aimLocal - GetTurretLocalOnMap();
+        var refreshed = BuildMarkTarget(task.aimLocal, target);
+        if (Mathf.Abs(Mathf.DeltaAngle(task.angel, refreshed.angel)) > 0.05f
+            || Mathf.Abs(task.distance - refreshed.distance) > 0.02f) {
+            MelonLogger.Msg(
+                $"[FCS] T{task.targetId} solution refreshed: {task.angel:F1}掳/{task.distance:F2}km -> {refreshed.angel:F1}掳/{refreshed.distance:F2}km");
+        }
+        task.angel = refreshed.angel;
+        task.distance = refreshed.distance;
+        task.position = refreshed.position;
     }
 
     public IEnumerator GetStableMarkTarget(int index, Action<ArtilleryTask?> completed,

@@ -32,6 +32,15 @@ public class ArtilleryTask {
     /// caller before EnqueueTask; not reset on enqueue.
     /// </summary>
     public int priority = 50;
+
+    /// <summary>
+    /// Fixed aim point on the map (map-local), captured at enqueue. When present, the
+    /// firing solution (angel/distance) is re-derived from the CURRENT turret-piece
+    /// position at every planning round — late binding, so origin recalibration while
+    /// the task waits in queue automatically corrects the solution.
+    /// </summary>
+    public bool hasAimPoint;
+    public UnityEngine.Vector3 aimLocal;
     public float angel;
     public float distance;
     public Vector3 position;
