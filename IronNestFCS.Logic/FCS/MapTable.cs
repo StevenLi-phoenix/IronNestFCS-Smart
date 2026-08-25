@@ -81,7 +81,20 @@ public class MapTable {
         };
     }
 
+    // The single turret miniature the game spawns on the tactical map (TurretLocationIcon).
+    // Its live position is the inferred ground truth for the firing origin — the commander
+    // (or an external mod) may reposition it; the real turret anchor is never consulted
+    // while the model exists.
+    private Transform? turretMapModel;
+
     private Vector3 GetTurretLocalOnMap() {
+        if (turretMapModel == null) {
+            var icon = UnityEngine.Object.FindObjectOfType<TurretLocationIcon>();
+            if (icon != null)
+                turretMapModel = icon.transform;
+        }
+        if (turretMapModel != null && mapSurface != null)
+            return mapSurface.InverseTransformPoint(turretMapModel.position);
         if (turretLocation == null || mapSurface == null)
             return Vector3.zero;
         return mapSurface.InverseTransformPoint(turretLocation.position);
