@@ -88,10 +88,17 @@ public class MapTable {
     private Transform? turretMapModel;
 
     private Vector3 GetTurretLocalOnMap() {
-        if (turretMapModel == null) {
-            var icon = UnityEngine.Object.FindObjectOfType<TurretLocationIcon>();
-            if (icon != null)
+        if (turretMapModel == null && mapSurface != null) {
+            var icons = UnityEngine.Object.FindObjectsOfType<TurretLocationIcon>();
+            foreach (var icon in icons) {
+                if (icon == null || !icon.gameObject.activeInHierarchy)
+                    continue;
+                var local = mapSurface.InverseTransformPoint(icon.transform.position);
+                MelonLogger.Msg(
+                    $"[FCS] turret map model candidate: '{icon.gameObject.name}' local=({local.x:F3},{local.y:F3},{local.z:F3}) count={icons.Length}");
                 turretMapModel = icon.transform;
+                break;
+            }
         }
         if (turretMapModel != null && mapSurface != null)
             return mapSurface.InverseTransformPoint(turretMapModel.position);
