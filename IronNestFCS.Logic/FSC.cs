@@ -197,5 +197,7 @@ public class FSC
 
     public void EnqueueTask(ArtilleryTask task) => Dispatcher.EnqueueTask(task);
 
+    public string? CancelPendingTask(int targetId) => Dispatcher.CancelPendingByTargetId(targetId);
+
     public IEnumerator ExposeAllEntities() => _sceneExposure.ExposeAllEntities();
 }
