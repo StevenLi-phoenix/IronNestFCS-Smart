@@ -29,13 +29,58 @@ internal sealed class FirePlanExecutor
     private const float TrackElevationEpsilonDegrees = 0.05f;
     // Residual delay assumed by the pre-fire correction: trigger protocol + a small nudge.
     private const float PreFirePrepSeconds = 15f;
-    // Residual delay assumed before the big elevation crank: the crank itself + trigger protocol.
-    private const float PreAimPrepSeconds = 35f;
+    // Pre-fire re-lay happens only when the predicted impact error is worth the extra delay
+    // (~1/3 of an HE blast radius); the pre-aim solve already carries most shots to impact.
+    private const float PreFireSignificantErrorKm = 0.05f;
+    // Full prep horizon for the pre-aim solve (crank + rotation + trigger protocol): with
+    // auto-fire this single refresh is expected to carry the shot all the way to impact.
+    private const float PreAimPrepSeconds = 45f;
 
     private sealed class ElevationSolve
     {
         public bool Ok;
         public float Elevation;
+        public bool Analytic;
+    }
+
+    /// <summary>
+    /// Analytic elevation re-solve calibrated from ONE known console solution (refDistance,
+    /// refElevation) for the same shell+charge: projectile range R = K*sin(2θ) gives
+    /// K = R0/sin(2θ0), then θ = asin(R/K)/2 on the same (high/low) arc as the reference.
+    /// Re-solve drifts are a few hundred meters, so local model error is second-order —
+    /// and no shared ballistic console time is spent at all.
+    /// </summary>
+    private static bool TryAnalyticElevation(
+        float refDistanceKm, float refElevationDeg, float newDistanceKm, out float elevationDeg)
+    {
+        elevationDeg = float.NaN;
+        if (refDistanceKm <= 0.01f || newDistanceKm <= 0.01f
+            || refElevationDeg <= 0.5f || refElevationDeg >= 89.5f)
+            return false;
+        var sin2 = Mathf.Sin(2f * refElevationDeg * Mathf.Deg2Rad);
+        if (sin2 < 1e-3f)
+            return false;
+        var k = refDistanceKm / sin2;
+        var s = newDistanceKm / k;
+        if (s <= 0f || s > 1f)
+            return false; // beyond this charge's reach — let the console (and its error path) decide
+        var fullAngle = Mathf.Asin(s) * Mathf.Rad2Deg; // = 2θ on the low arc
+        elevationDeg = refElevationDeg > 45f ? 90f - fullAngle / 2f : fullAngle / 2f;
+        return true;
+    }
+
+    /// <summary>Analytic solve first (instant, no lock); physical console as fallback.</summary>
+    private IEnumerator ResolveElevation(
+        FirePlan plan, float refDistanceKm, float refElevationDeg, ElevationSolve result, int lockPriority)
+    {
+        if (TryAnalyticElevation(refDistanceKm, refElevationDeg, plan.Task.distance, out var analytic))
+        {
+            result.Ok = true;
+            result.Elevation = analytic;
+            result.Analytic = true;
+            yield break;
+        }
+        yield return SolveElevationForLoadedCharge(plan, result, lockPriority);
     }
 
     /// <summary>
@@ -341,18 +386,21 @@ internal sealed class FirePlanExecutor
         var aimElevation = plan.Elevation;
         if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
         {
+            // The console solved plan.Elevation for THIS distance — the calibration pair.
+            var refDistance = plan.Task.distance;
             if (plan.Task.trackEntityId.Length > 0)
                 _fcs.MapTable.UpdateEntityMotion(plan.Task);
             _fcs.MapTable.ApplyMotionModel(plan.Task, PreAimPrepSeconds);
             _fcs.MapTable.RefreshSolution(plan.Task);
             var aimSolve = new ElevationSolve();
-            yield return SolveElevationForLoadedCharge(plan, aimSolve, plan.Task.priority);
+            yield return ResolveElevation(plan, refDistance, plan.Elevation, aimSolve, plan.Task.priority);
             if (!IsActive(plan))
                 yield break;
             if (aimSolve.Ok && Mathf.Abs(aimSolve.Elevation - aimElevation) > TrackElevationEpsilonDegrees)
             {
                 MelonLogger.Msg(
-                    $"[FCS Track] {plan.Label}: pre-aim elevation refresh {aimElevation:F2}° -> {aimSolve.Elevation:F2}°");
+                    $"[FCS Track] {plan.Label}: pre-aim elevation refresh {aimElevation:F2}° -> {aimSolve.Elevation:F2}°" +
+                    (aimSolve.Analytic ? " (analytic)" : " (console)"));
                 aimElevation = aimSolve.Elevation;
                 plan.Task.elevation = aimSolve.Elevation;
             }
@@ -425,15 +473,21 @@ internal sealed class FirePlanExecutor
         var appliedDistance = plan.Task.distance;
         if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
         {
+            // Refreshing the model and comparing is cheap; physically re-laying is not.
+            // Convert the drift into predicted impact error and only touch the gun when it
+            // is significant — the pre-aim solve already carries most shots to impact.
             if (plan.Task.trackEntityId.Length > 0)
                 _fcs.MapTable.UpdateEntityMotion(plan.Task);
             _fcs.MapTable.ApplyMotionModel(plan.Task, PreFirePrepSeconds);
             _fcs.MapTable.RefreshSolution(plan.Task);
 
-            if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)
+            var crossErrorKm = Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel))
+                               * Mathf.Deg2Rad * plan.Task.distance;
+            if (crossErrorKm > PreFireSignificantErrorKm)
             {
                 MelonLogger.Msg(
-                    $"[FCS Track] {plan.Label}: pre-fire azimuth correction {appliedAzimuth:F2}° -> {plan.Task.angel:F2}°");
+                    $"[FCS Track] {plan.Label}: pre-fire azimuth correction {appliedAzimuth:F2}° -> {plan.Task.angel:F2}° " +
+                    $"(cross error {crossErrorKm * 1000f:F0}m)");
                 yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
                     plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
                 if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
@@ -442,25 +496,30 @@ internal sealed class FirePlanExecutor
                     appliedAzimuth = plan.Task.angel;
             }
 
-            var preFireSolve = new ElevationSolve();
-            yield return SolveElevationForLoadedCharge(plan, preFireSolve, plan.Task.priority);
-            if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
-                yield break;
-            if (preFireSolve.Ok)
+            var rangeErrorKm = Mathf.Abs(plan.Task.distance - appliedDistance);
+            if (rangeErrorKm > PreFireSignificantErrorKm)
             {
-                appliedDistance = plan.Task.distance;
-                if (Mathf.Abs(preFireSolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                var preFireSolve = new ElevationSolve();
+                yield return ResolveElevation(plan, appliedDistance, appliedElevation, preFireSolve, plan.Task.priority);
+                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                    yield break;
+                if (preFireSolve.Ok)
                 {
-                    MelonLogger.Msg(
-                        $"[FCS Track] {plan.Label}: pre-fire elevation correction {appliedElevation:F2}° -> {preFireSolve.Elevation:F2}°");
-                    var correctionGun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
-                    yield return correctionGun.SetElevation(preFireSolve.Elevation, ElevationTimeoutSeconds);
-                    if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
-                        yield break;
-                    if (correctionGun.LastElevationSucceeded)
+                    appliedDistance = plan.Task.distance;
+                    if (Mathf.Abs(preFireSolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
                     {
-                        appliedElevation = preFireSolve.Elevation;
-                        plan.Task.elevation = preFireSolve.Elevation;
+                        MelonLogger.Msg(
+                            $"[FCS Track] {plan.Label}: pre-fire elevation correction {appliedElevation:F2}° -> {preFireSolve.Elevation:F2}° " +
+                            $"(range error {rangeErrorKm * 1000f:F0}m)");
+                        var correctionGun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
+                        yield return correctionGun.SetElevation(preFireSolve.Elevation, ElevationTimeoutSeconds);
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (correctionGun.LastElevationSucceeded)
+                        {
+                            appliedElevation = preFireSolve.Elevation;
+                            plan.Task.elevation = preFireSolve.Elevation;
+                        }
                     }
                 }
             }
@@ -628,7 +687,7 @@ internal sealed class FirePlanExecutor
                     if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
                     {
                         var relaySolve = new ElevationSolve();
-                        yield return SolveElevationForLoadedCharge(plan, relaySolve, 10);
+                        yield return ResolveElevation(plan, appliedDistance, appliedElevation, relaySolve, 10);
                         if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
                             yield break;
                         if (relaySolve.Ok)
