@@ -58,6 +58,22 @@ public class ArtilleryTask {
     public UnityEngine.Vector3 motionOriginLocal;
     public UnityEngine.Vector3 motionVelLocalPerSec;
     public float motionT0;
+
+    /// <summary>Human-readable moving-target summary for HUD/agent task lines ("" for static tasks).</summary>
+    public string MotionSuffix(bool zh) {
+        if (!hasMotion && trackEntityId.Length == 0)
+            return "";
+        var speedKmh = motionVelLocalPerSec.magnitude * 3.8164f * 3600f;
+        var course = UnityEngine.Mathf.Atan2(motionVelLocalPerSec.x, motionVelLocalPerSec.y) * UnityEngine.Mathf.Rad2Deg;
+        if (course < 0) course += 360f;
+        var head = trackEntityId.Length > 0
+            ? (zh ? $"跟踪 {trackEntityId}" : $"track {trackEntityId}")
+            : (zh ? "运动模型" : "motion");
+        var lost = trackingLost ? (zh ? "·失联外推" : "·extrapolating") : "";
+        return speedKmh < 0.5f
+            ? $" · {head}{(zh ? "(静止)" : "(static)")}{lost}"
+            : $" · {head} {speedKmh:F0}km/h→{course:000}°{lost}";
+    }
     public float angel;
     public float distance;
     public Vector3 position;
