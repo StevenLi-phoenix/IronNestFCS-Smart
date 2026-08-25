@@ -81,7 +81,21 @@ public class MapTable {
         };
     }
 
+    /// <summary>
+    /// Commander-declared turret token: a physical object named this, parented under the
+    /// Draggable Surface (created/moved by external mods or, eventually, dragged by hand).
+    /// When present, its live localPosition replaces the TurretLocation ground truth in
+    /// all marker→solution math — used after 阵地转移 when the commander recalibrates.
+    /// Looked up lazily so it may appear/disappear at any time.
+    /// </summary>
+    public const string DeclaredTurretTokenName = "MapToken_TurretDeclared";
+    private Transform? declaredTurretToken;
+
     private Vector3 GetTurretLocalOnMap() {
+        if (mapSurface != null && declaredTurretToken == null)
+            declaredTurretToken = mapSurface.Find(DeclaredTurretTokenName);
+        if (declaredTurretToken != null)
+            return declaredTurretToken.localPosition;
         if (turretLocation == null || mapSurface == null)
             return Vector3.zero;
         return mapSurface.InverseTransformPoint(turretLocation.position);
