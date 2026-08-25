@@ -198,24 +198,27 @@ public class FSC
 
     public void EnqueueTask(ArtilleryTask task) => Dispatcher.EnqueueTask(task);
 
-    public string? CancelPendingTask(int targetId) => Dispatcher.CancelPendingByTargetId(targetId);
+    // Task handle discipline: the unique serial (#N) is the ONLY external handle for
+    // cancel/adjust — targetId is the recycled map-marker id and repeats.
+    public string? CancelPendingTask(int serial) => Dispatcher.CancelPendingBySerial(serial);
 
     /// <summary>
-    /// LLM-initiated aim adjustment on an already-queued or in-preparation task (by T-number).
-    /// Non-blocking by design: execution never waits for adjustments — with no adjustment the
-    /// task fires on its original solution; with one, the staged re-solve pipeline lays the
-    /// new point on its next pass. WaitingForFire under auto-fire may already be too late.
+    /// LLM-initiated aim adjustment on an already-queued or in-preparation task (by unique
+    /// serial #N). Non-blocking by design: execution never waits for adjustments — with no
+    /// adjustment the task fires on its original solution; with one, the staged re-solve
+    /// pipeline lays the new point on its next pass. WaitingForFire under auto-fire may
+    /// already be too late.
     /// </summary>
-    public string AdjustTaskAim(int targetId, float localX, float localY)
+    public string AdjustTaskAim(int serial, float localX, float localY)
     {
-        if (LeftTask is { } lt && lt.targetId == targetId && lt.progress is not (Progress.Finished or Progress.Failed))
+        if (LeftTask is { } lt && lt.serial == serial && lt.progress is not (Progress.Finished or Progress.Failed))
             return MapTable.AdjustAim(lt, localX, localY, onGun: true);
-        if (RightTask is { } rt && rt.targetId == targetId && rt.progress is not (Progress.Finished or Progress.Failed))
+        if (RightTask is { } rt && rt.serial == serial && rt.progress is not (Progress.Finished or Progress.Failed))
             return MapTable.AdjustAim(rt, localX, localY, onGun: true);
         foreach (var task in Dispatcher.QueueSnapshot)
-            if (task.targetId == targetId)
+            if (task.serial == serial)
                 return MapTable.AdjustAim(task, localX, localY, onGun: false);
-        return $"no adjustable task T{targetId} — 不在等待队列也不在炮位上(已出膛/已完成/已清除)";
+        return $"no adjustable task #{serial} — 不在等待队列也不在炮位上(已出膛/已完成/已清除)";
     }
 
     /// <summary>External punchcard purchase (e.g. scout plane): queued into the console coordinator.</summary>

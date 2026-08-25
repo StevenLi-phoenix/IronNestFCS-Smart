@@ -92,8 +92,8 @@ public class FcsWindow
             {
                 var position = ConvertPosition(item.position);
                 Label(FcsLocalization.T(
-                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°{item.MotionSuffix(true)}",
-                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°{item.MotionSuffix(false)}"));
+                    $"  #{item.serial} P{item.priority} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°{item.MotionSuffix(true)}",
+                    $"  #{item.serial} P{item.priority} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°{item.MotionSuffix(false)}"));
             }
         }
     }
@@ -139,10 +139,13 @@ public class FcsWindow
             return;
         }
 
+        // T1/T2 are FIXED position labels for the left/right gun's current task; the unique
+        // task identity is the serial (#N). Marker ids are internal and never displayed.
+        var slot = side == "Left" ? "T1" : "T2";
         var elapsed = task.startedAt > 0f ? FcsRuntimeClock.Now - task.startedAt : 0f;
         label(FcsLocalization.T(
-            $"{gunName}：T{task.targetId} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}秒",
-            $"{gunName}: T{task.targetId} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}s"));
+            $"{gunName}：{slot} #{task.serial} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}秒",
+            $"{gunName}: {slot} #{task.serial} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}s"));
 
         var position = ConvertPosition(task.position);
         var flightZh = float.IsNaN(estimatedFlightSeconds) ? "--" : $"{estimatedFlightSeconds:F1}秒";

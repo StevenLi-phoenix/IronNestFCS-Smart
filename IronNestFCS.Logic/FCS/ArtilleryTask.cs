@@ -27,6 +27,13 @@ public class ArtilleryTask {
     public int targetId;
 
     /// <summary>
+    /// Unique task serial (#1, #2, … per mission), assigned once at first enqueue and never
+    /// reused. targetId is the MAP MARKER id and repeats as markers are recycled — the serial
+    /// is the only unambiguous handle for adjust/cancel operations.
+    /// </summary>
+    public int serial;
+
+    /// <summary>
     /// Scheduling priority (0-100, default 50). Higher wins gun assignment before charge-resource
     /// protection; >= 90 (e.g. counter-battery) also skips the match coalesce window. Set by the
     /// caller before EnqueueTask; not reset on enqueue.
