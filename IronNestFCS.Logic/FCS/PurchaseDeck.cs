@@ -9,6 +9,9 @@ namespace IronNestFCS.Logic.FCS;
 public class PurchaseDeck {
     private const float SyncIntervalSeconds = 0.25f;
     private const int StableSamplesRequired = 3;
+    // The console's physical card slot; teleporting a card here + MoveToSlot() is the
+    // same path a player's drag takes.
+    private static readonly Vector3 CardSlotPosition = new(6.4814f, -2.4675f, -22.0968f);
 
     private Transform? _requisitionConsole;
     private Transform? _powderCard;
@@ -114,13 +117,7 @@ public class PurchaseDeck {
                 continue;
             }
 
-            if (TryParse(
-                    id
-                        .Replace("SMOKE", "SMK")
-                        .Replace("PCLM", "PLCM")
-                        .Replace("Shell", ""),
-                    out BulletType type
-                )) {
+            if (TryParse(NormalizeCardId(id), out BulletType type)) {
                 nextCards[type] = card.transform;
             }
             else if (id == "PowderCharges") {
@@ -193,9 +190,29 @@ public class PurchaseDeck {
         return true;
     }
     
+    /// <summary>Game card IDs -> BulletType/agent names ("SMOKEShell" -> "SMK" etc.). ONE place — the
+    /// scan and every buy path must agree, or a card scanned under one name can't be bought by it.</summary>
+    private static string NormalizeCardId(string id) =>
+        id.Replace("SMOKE", "SMK").Replace("PCLM", "PLCM").Replace("Shell", "").Trim();
+
     private DialInteractable GetLeftRightDial() {
         var consoleBox = GameObject.Find("Console Box").transform;
         return consoleBox.GetComponentInChildren<DialInteractable>();
+    }
+
+    /// <summary>Shared physical core of every purchase: slot the card in, wait for the console
+    /// to accept it. Caller configures any card-specific dials afterwards, then PressBuy().</summary>
+    private static IEnumerator InsertCard(Transform card) {
+        yield return FcsRuntimeClock.WaitUntilFocused();
+        card.position = CardSlotPosition;
+        card.GetComponent<DraggableItem>()?.MoveToSlot();
+        yield return FcsRuntimeClock.WaitForSeconds(0.5f);
+        yield return FcsRuntimeClock.WaitUntilFocused();
+    }
+
+    private IEnumerator PressBuy() {
+        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
+        yield return FcsRuntimeClock.WaitForSeconds(2f);
     }
 
     public IEnumerator BuyShell(BulletType type, LeftRight leftRight) {
@@ -205,23 +222,9 @@ public class PurchaseDeck {
             yield break;
         }
 
-        yield return FcsRuntimeClock.WaitUntilFocused();
-        var target = new Vector3(6.4814f, -2.4675f, -22.0968f);
-        card.position = target;
-        card.GetComponent<DraggableItem>().MoveToSlot();
-        yield return FcsRuntimeClock.WaitForSeconds(0.5f);
-        yield return FcsRuntimeClock.WaitUntilFocused();
-        
-        switch (leftRight) {
-            case LeftRight.Left:
-                GetLeftRightDial().SetDialValue(0);
-                break;
-            case LeftRight.Right:
-                GetLeftRightDial().SetDialValue(1);
-                break;
-        }
-        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
-        yield return FcsRuntimeClock.WaitForSeconds(2f);
+        yield return InsertCard(card);
+        GetLeftRightDial().SetDialValue(leftRight == LeftRight.Left ? 0 : 1);
+        yield return PressBuy();
     }
 
     /// <summary>
@@ -259,9 +262,8 @@ public class PurchaseDeck {
             try { id = runtime.CurrentDefinition?.ID; } catch { }
             if (string.IsNullOrWhiteSpace(id)) continue;
             available.Add(id!);
-            var normalized = id!.Replace("SMOKE", "SMK").Replace("Shell", "").Trim();
             if (string.Equals(id, cardId, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(normalized, cardId, StringComparison.OrdinalIgnoreCase)) {
+                || string.Equals(NormalizeCardId(id!), cardId, StringComparison.OrdinalIgnoreCase)) {
                 card = runtime.transform;
             }
         }
@@ -269,16 +271,12 @@ public class PurchaseDeck {
             done($"card '{cardId}' not found; available [{string.Join(", ", available)}]");
             yield break;
         }
-
-        yield return FcsRuntimeClock.WaitUntilFocused();
-        card.position = new Vector3(6.4814f, -2.4675f, -22.0968f);
-        var draggable = card.GetComponent<DraggableItem>();
-        if (draggable == null) {
+        if (card.GetComponent<DraggableItem>() == null) {
             done("card has no DraggableItem");
             yield break;
         }
-        draggable.MoveToSlot();
-        yield return FcsRuntimeClock.WaitForSeconds(0.6f);
+
+        yield return InsertCard(card);
 
         if (bearingDeg is { } bearing) {
             DialOdometerPunchcardBridge? bridge = null;
@@ -337,8 +335,7 @@ public class PurchaseDeck {
             yield return FcsRuntimeClock.WaitForSeconds(0.4f);
         }
 
-        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
-        yield return FcsRuntimeClock.WaitForSeconds(2f);
+        yield return PressBuy();
         done("ok");
     }
 
@@ -348,12 +345,7 @@ public class PurchaseDeck {
             yield break;
         }
 
-        yield return FcsRuntimeClock.WaitUntilFocused();
-        _powderCard.position = new Vector3(6.4814f, -2.4675f, -22.0968f);
-        _powderCard.GetComponent<DraggableItem>().MoveToSlot();
-        yield return FcsRuntimeClock.WaitForSeconds(0.5f);
-        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
-        yield return FcsRuntimeClock.WaitForSeconds(2f);
+        yield return InsertCard(_powderCard);
+        yield return PressBuy();
     }
-    
 }
