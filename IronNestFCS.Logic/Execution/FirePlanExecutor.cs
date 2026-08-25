@@ -44,28 +44,23 @@ internal sealed class FirePlanExecutor
     }
 
     /// <summary>
-    /// Analytic elevation re-solve calibrated from ONE known console solution (refDistance,
-    /// refElevation) for the same shell+charge: projectile range R = K*sin(2θ) gives
-    /// K = R0/sin(2θ0), then θ = asin(R/K)/2 on the same (high/low) arc as the reference.
-    /// Re-solve drifts are a few hundred meters, so local model error is second-order —
-    /// and no shared ballistic console time is spent at all.
+    /// Analytic elevation re-solve. The game's ballistics are LINEAR:
+    /// elevation = distance / maxRange(charge) * 60, with maxRange = charge * 5 km —
+    /// i.e. elevation = distance * 12 / charge, capped at 60°. Calibrating the slope from
+    /// the plan's own console solution (elevation = ref * new/ref distance, a line through
+    /// the origin) reproduces that formula exactly while staying correct for any shell
+    /// whose max range deviates from the 5 km-per-charge pattern.
     /// </summary>
     private static bool TryAnalyticElevation(
         float refDistanceKm, float refElevationDeg, float newDistanceKm, out float elevationDeg)
     {
         elevationDeg = float.NaN;
-        if (refDistanceKm <= 0.01f || newDistanceKm <= 0.01f
-            || refElevationDeg <= 0.5f || refElevationDeg >= 89.5f)
+        if (refDistanceKm <= 0.01f || newDistanceKm <= 0.01f || refElevationDeg <= 0.1f)
             return false;
-        var sin2 = Mathf.Sin(2f * refElevationDeg * Mathf.Deg2Rad);
-        if (sin2 < 1e-3f)
-            return false;
-        var k = refDistanceKm / sin2;
-        var s = newDistanceKm / k;
-        if (s <= 0f || s > 1f)
+        var candidate = refElevationDeg * (newDistanceKm / refDistanceKm);
+        if (candidate <= 0f || candidate > 60.01f)
             return false; // beyond this charge's reach — let the console (and its error path) decide
-        var fullAngle = Mathf.Asin(s) * Mathf.Rad2Deg; // = 2θ on the low arc
-        elevationDeg = refElevationDeg > 45f ? 90f - fullAngle / 2f : fullAngle / 2f;
+        elevationDeg = Mathf.Min(candidate, 60f);
         return true;
     }
 
