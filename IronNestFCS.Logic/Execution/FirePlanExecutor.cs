@@ -21,6 +21,12 @@ internal sealed class FirePlanExecutor
     private const float ElevationTimeoutSeconds = 35f;
     private const float LoadingObservationTimeoutSeconds = 90f;
     private const float AutoFireTimeoutSeconds = 25f;
+    // Manual-fire live tracking: while a moving-target plan waits for the player to pull
+    // the trigger, keep re-laying the gun so a late pull still hits.
+    private const float TrackRelayIntervalSeconds = 3f;
+    private const float TrackAzimuthEpsilonDegrees = 0.1f;
+    private const float TrackDistanceEpsilonKm = 0.03f;
+    private const float TrackElevationEpsilonDegrees = 0.05f;
     private const float SameAzimuthToleranceDegrees = 0.09f;
     private const int FireSettlementBufferFrames = 3;
     private const float ReviewLeadTimeBeforeArmSeconds = 1.5f;
@@ -205,7 +211,7 @@ internal sealed class FirePlanExecutor
         if (needsPersistentLoad)
         {
             plan.Task.progress = Progress.SelectingBullet;
-            yield return _fcs.SharedResources.Requisition.Acquire();
+            yield return _fcs.SharedResources.Requisition.Acquire(plan.Task.priority);
             try
             {
                 var attempts = 0;
@@ -355,7 +361,7 @@ internal sealed class FirePlanExecutor
 
         try
         {
-            yield return _fcs.SharedResources.Trigger.Acquire();
+            yield return _fcs.SharedResources.Trigger.Acquire(plan.Task.priority);
             try
             {
                 if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
@@ -440,6 +446,12 @@ internal sealed class FirePlanExecutor
                 : null;
             var resumeGeneration = FcsRuntimeClock.ResumeGeneration;
 
+            // Manual-fire live tracking state: what the gun is physically laid on right now.
+            var appliedAzimuth = plan.Azimuth;
+            var appliedElevation = plan.Elevation;
+            var appliedDistance = plan.Task.distance;
+            var nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
+
             while (true)
             {
                 yield return FcsRuntimeClock.WaitUntilFocused();
@@ -480,6 +492,75 @@ internal sealed class FirePlanExecutor
                     yield break;
                 }
 
+                // Manual fire on a moving target: the player decides WHEN, so the gun must keep
+                // following the motion model until the trigger is pulled. Azimuth is pure
+                // geometry; elevation re-solves on the ballistic console at LOW priority (10)
+                // so live re-lay never delays planning of new tasks.
+                if (!autoFireDeadline.HasValue
+                    && (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+                    && FcsRuntimeClock.Now >= nextRelay)
+                {
+                    nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
+                    if (plan.Task.trackEntityId.Length > 0)
+                        _fcs.MapTable.UpdateEntityMotion(plan.Task);
+                    _fcs.MapTable.ApplyMotionModel(plan.Task);
+                    _fcs.MapTable.RefreshSolution(plan.Task);
+
+                    if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)
+                    {
+                        MelonLogger.Msg(
+                            $"[FCS Track] {plan.Label}: manual-wait azimuth re-lay {appliedAzimuth:F2}° -> {plan.Task.angel:F2}°");
+                        yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+                            plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (_fcs.Turret.LastRotationSucceeded)
+                            appliedAzimuth = plan.Task.angel;
+                    }
+
+                    if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
+                    {
+                        var newElevation = float.NaN;
+                        var solved = false;
+                        yield return _fcs.SharedResources.Ballistic.Acquire(10);
+                        try
+                        {
+                            yield return FcsRuntimeClock.WaitUntilFocused();
+                            yield return _fcs.BallisticCalculator.SetDistance(plan.Task.distance);
+                            yield return _fcs.BallisticCalculator.SetDirection(plan.Task.angel);
+                            yield return _fcs.BallisticCalculator.SetCharge(plan.Task.chargeCount);
+                            yield return _fcs.BallisticCalculator.SetShellType(plan.Task.bulletType);
+                            yield return _fcs.BallisticCalculator.Calculate();
+                            newElevation = _fcs.BallisticCalculator.GetElevation();
+                            solved = _fcs.BallisticCalculator.LastCalculationSucceeded && !float.IsNaN(newElevation);
+                        }
+                        finally
+                        {
+                            _fcs.SharedResources.Ballistic.Release();
+                        }
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (solved)
+                        {
+                            appliedDistance = plan.Task.distance;
+                            if (Mathf.Abs(newElevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                            {
+                                MelonLogger.Msg(
+                                    $"[FCS Track] {plan.Label}: manual-wait elevation re-lay {appliedElevation:F2}° -> {newElevation:F2}°");
+                                var gun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
+                                yield return gun.SetElevation(newElevation, ElevationTimeoutSeconds);
+                                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                                    yield break;
+                                if (gun.LastElevationSucceeded)
+                                {
+                                    appliedElevation = newElevation;
+                                    plan.Task.elevation = newElevation;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 yield return FcsRuntimeClock.WaitForSeconds(0.1f);
             }
         }
@@ -499,7 +580,7 @@ internal sealed class FirePlanExecutor
 
         // The first check prevents pointless Trigger-lane work. It is not authorization: the live relationship may
         // change while this coroutine waits for the shared physical console lane.
-        yield return _fcs.SharedResources.Trigger.Acquire();
+        yield return _fcs.SharedResources.Trigger.Acquire(follower.Task.priority);
         try
         {
             current = _current;
