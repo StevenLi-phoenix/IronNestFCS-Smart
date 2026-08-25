@@ -980,9 +980,90 @@ internal sealed class FirePlanExecutor
         return true;
     }
 
+    /// <summary>
+    /// Powder-loading failures are recoverable, not terminal. (a) Commit mismatch: powder
+    /// cannot be added once committed — the ONLY way to clear the gun is to fire the round;
+    /// if the committed charge still reaches the target the task simply replans onto it,
+    /// otherwise a chamber-clearing dump shot goes out on the same bearing at the actual
+    /// charge's range and the original task requeues for a fresh full load. (b) A dispenser
+    /// reported inactive is transient (stock replenishing) — bounded requeue.
+    /// </summary>
+    private bool TryRecoverPowderFailure(FirePlan plan, string reason)
+    {
+        var task = plan.Task;
+
+        var m = System.Text.RegularExpressions.Regex.Match(
+            reason, @"powder commit mismatch: expected C(\d+), physical C(\d+)");
+        if (m.Success && int.TryParse(m.Groups[2].Value, out var physical) && physical >= 1)
+        {
+            if (task.loadRetryCount >= 3)
+                return false;   // repeated mismatch loop — give up for real
+            task.loadRetryCount++;
+
+            DetachForRequeue(plan, reason);
+            if (task.distance <= physical * 5f + 0.01f)
+            {
+                MelonLogger.Warning(
+                    $"[FCS Plan] {plan.Label}: committed C{physical} still reaches {task.distance:F2}km — requeued to fire on the actual charge");
+            }
+            else
+            {
+                var dumpRange = physical * 5f * 0.9f;
+                var dump = new ArtilleryTask
+                {
+                    bulletType = task.bulletType,
+                    priority = Math.Min(100, task.priority + 5),
+                    hasAimPoint = true,
+                    aimLocal = _fcs.MapTable.ShortenedAim(task, dumpRange),
+                };
+                _fcs.MapTable.RefreshSolution(dump);
+                _fcs.Dispatcher.EnqueueTask(dump);
+                MelonLogger.Warning(
+                    $"[FCS Plan] {plan.Label}: chamber committed C{physical}, target {task.distance:F2}km out of its reach — " +
+                    $"queued chamber-clearing shot #{dump.serial} at {dumpRange:F1}km same bearing; original requeued for fresh load");
+            }
+            _fcs.Dispatcher.EnqueueTask(task);
+            return true;
+        }
+
+        if (reason.Contains("powder dispenser") && task.loadRetryCount < 2)
+        {
+            task.loadRetryCount++;
+            DetachForRequeue(plan, reason);
+            MelonLogger.Warning(
+                $"[FCS Plan] {plan.Label}: transient dispenser failure, retry {task.loadRetryCount}/2 — requeued");
+            _fcs.Dispatcher.EnqueueTask(task);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void DetachForRequeue(FirePlan plan, string reason)
+    {
+        plan.Failed = true;
+        plan.FailureReason = reason;
+        CancelPreparation(plan);
+        if (ReferenceEquals(_fireWaitOwner, plan))
+            ClearAllFireWait();
+        if (ReferenceEquals(_current, plan))
+            _current = null;
+        if (ReferenceEquals(_next, plan))
+            _next = null;
+        ReleaseGunSlot(plan, notify: true);
+
+        var task = plan.Task;
+        task.progress = Progress.Pending;
+        task.failureReason = "";
+        task.pendingHint = PendingHint.None;
+    }
+
     private void FailPlan(FirePlan plan, string reason)
     {
         if (plan.CompletionHandled)
+            return;
+
+        if (TryRecoverPowderFailure(plan, reason))
             return;
 
         plan.Failed = true;

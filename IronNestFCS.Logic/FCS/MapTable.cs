@@ -272,6 +272,22 @@ public class MapTable {
     }
 
     /// <summary>
+    /// Aim point on the turret→task bearing shortened to rangeKm — for chamber-clearing
+    /// dump shots when the committed charge cannot reach the original target.
+    /// </summary>
+    public Vector3 ShortenedAim(ArtilleryTask task, float rangeKm) {
+        var turret = GetTurretLocalOnMap();
+        var dir = task.aimLocal - turret;
+        dir.z = 0;
+        var lenKm = new Vector2(dir.x, dir.y).magnitude * 3.8164f;
+        if (lenKm < 0.01f)
+            return task.aimLocal;
+        var aim = turret + dir * (rangeKm / lenKm);
+        aim.z = task.aimLocal.z;
+        return aim;
+    }
+
+    /// <summary>
     /// Late-bound solution refresh: recompute angel/distance from the task's fixed aim
     /// point and the turret piece's CURRENT position. Called each planning round so a
     /// recalibrated origin corrects every queued task before it reaches a gun.

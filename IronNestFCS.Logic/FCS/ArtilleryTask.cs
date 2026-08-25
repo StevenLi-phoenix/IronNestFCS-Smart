@@ -107,6 +107,10 @@ public class ArtilleryTask {
     public float completedAt;
     public string failureReason = "";
 
+    // Transient powder-loading failures (dispenser momentarily inactive while stock
+    // replenishes) get a bounded number of automatic requeues before failing for real.
+    public int loadRetryCount;
+
     // Runtime-only dispatch memory. If a preloaded gun is tried and its fixed shell/charge cannot
     // solve the target, exclude that side and let the same task fall back to the other gun.
     // Bit 0 = Left, bit 1 = Right. Reset when a brand-new target is enqueued.
