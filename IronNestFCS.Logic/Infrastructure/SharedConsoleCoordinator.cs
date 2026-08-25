@@ -8,6 +8,8 @@ namespace IronNestFCS.Logic.Infrastructure;
 public sealed class ConsoleCardRequest {
     public string CardId = "";
     public float? BearingDeg;
+    /// <summary>Recon start cell like "P4" — drives the console's grid split-flap dials.</summary>
+    public string? StartGrid;
     /// <summary>Higher runs first (e.g. 紧急转移 emergency-relocation cards at 100).</summary>
     public int Priority = 50;
 }
@@ -88,7 +90,7 @@ internal sealed class SharedConsoleCoordinator {
             yield return Requisition.Acquire();
             try {
                 yield return FcsRuntimeClock.WaitUntilFocused();
-                yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, result => {
+                yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.StartGrid, result => {
                     LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
                     MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
                 });

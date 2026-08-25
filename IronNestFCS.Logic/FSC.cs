@@ -205,14 +205,18 @@ public class FSC
         => RequestConsoleCard(cardId, bearingDeg, hasBearing, 50);
 
     public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, priority, null);
+
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority, string? startGrid)
     {
         SharedResources.EnqueueCardRequest(new Infrastructure.ConsoleCardRequest
         {
             CardId = cardId,
             BearingDeg = hasBearing ? bearingDeg : null,
+            StartGrid = string.IsNullOrWhiteSpace(startGrid) ? null : startGrid,
             Priority = priority,
         });
-        return $"queued to FCS console coordinator (P{priority})";
+        return $"queued to FCS console coordinator (P{priority}{(string.IsNullOrWhiteSpace(startGrid) ? "" : $", start {startGrid}")})";
     }
 
     public string ConsoleCardRequestResult => SharedResources.LastCardRequestResult;
