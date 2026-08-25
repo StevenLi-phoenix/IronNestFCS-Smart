@@ -8,6 +8,8 @@ namespace IronNestFCS.Logic.Infrastructure;
 public sealed class ConsoleCardRequest {
     public string CardId = "";
     public float? BearingDeg;
+    /// <summary>Higher runs first (e.g. 紧急转移 emergency-relocation cards at 100).</summary>
+    public int Priority = 50;
 }
 
 /// <summary>
@@ -49,12 +51,23 @@ internal sealed class SharedConsoleCoordinator {
         }
     }
 
-    private readonly Queue<ConsoleCardRequest> _cardRequests = new();
+    private readonly List<ConsoleCardRequest> _cardRequests = new();
 
     /// <summary>Latest completed card-request outcome, for external observers to poll.</summary>
     public string LastCardRequestResult { get; private set; } = "";
 
-    public void EnqueueCardRequest(ConsoleCardRequest request) => _cardRequests.Enqueue(request);
+    public void EnqueueCardRequest(ConsoleCardRequest request) => _cardRequests.Add(request);
+
+    private ConsoleCardRequest? PopHighestPriorityRequest() {
+        if (_cardRequests.Count == 0) return null;
+        ConsoleCardRequest? best = null;
+        foreach (var request in _cardRequests) {
+            if (best == null || request.Priority > best.Priority)
+                best = request; // list order is FIFO within equal priority
+        }
+        _cardRequests.Remove(best!);
+        return best;
+    }
 
     /// <summary>
     /// Drains externally submitted punchcard purchases inside the coordinator's own
@@ -66,9 +79,10 @@ internal sealed class SharedConsoleCoordinator {
             if (_cardRequests.Count == 0) continue;
             yield return FcsRuntimeClock.WaitUntilFocused();
 
-            var request = _cardRequests.Dequeue();
+            var request = PopHighestPriorityRequest();
+            if (request == null) continue;
             MelonLogger.Msg(
-                $"[FCS] console card request: {request.CardId}" +
+                $"[FCS] console card request: {request.CardId} P{request.Priority}" +
                 (request.BearingDeg is { } b ? $" bearing {b:F1}掳" : ""));
 
             yield return Requisition.Acquire();
