@@ -6,6 +6,7 @@ using System.Collections;
 using IronNestFCS.Abstractions;
 using IronNestFCS.Logic.FCS;
 using MelonLoader;
+using UnityEngine;
 
 namespace IronNestFCS.Logic.Scheduling;
 
@@ -137,6 +138,7 @@ internal sealed class TaskDispatcher
         }
 
         var snapshot = _fcs.Planner.CaptureSnapshot();
+        PlanEngagementOrder(snapshot.CurrentAzimuth);
         var planningResults = new List<TaskPlanningResult>();
         // Retry ownership belongs to a free transient gun side, not to whether a particular task had zero
         // candidates. A task may be eligible on Left while Right is still recovering; if Right opens during
@@ -297,6 +299,58 @@ internal sealed class TaskDispatcher
         }
 
         _fcs.PlanExecutor.EvaluateScheduling();
+    }
+
+    /// <summary>
+    /// 炮击顺序规划 (engagement sequencing). Elevation cranks are per-gun and run in
+    /// parallel with loading, so the only serialized cost between consecutive shots is
+    /// the SHARED turret's horizontal rotation. Within each priority band, chain pending
+    /// tasks nearest-azimuth-next starting from the turret's current bearing; bands stay
+    /// in strict priority order and the serial breaks ties. The queue itself is rebuilt
+    /// in the planned order, so the HUD, the agent snapshot and the matcher's positional
+    /// tie-breaking all follow one sequence. Runs every planning round on fresh solutions,
+    /// so recalibration, re-aims and cancellations re-plan the order automatically.
+    /// </summary>
+    private void PlanEngagementOrder(float currentAzimuth)
+    {
+        if (_taskQueue.Count < 2)
+            return;
+
+        var before = _taskQueue.Select(t => t.serial).ToArray();
+        var ordered = new List<ArtilleryTask>(_taskQueue.Count);
+        var cursor = currentAzimuth;
+        foreach (var band in _taskQueue.GroupBy(t => t.priority).OrderByDescending(g => g.Key))
+        {
+            var remaining = band.ToList();
+            while (remaining.Count > 0)
+            {
+                ArtilleryTask? next = null;
+                var bestTravel = float.MaxValue;
+                foreach (var task in remaining)
+                {
+                    var travel = Mathf.Abs(Mathf.DeltaAngle(cursor, task.angel));
+                    if (next == null
+                        || travel < bestTravel - 0.01f
+                        || (Mathf.Abs(travel - bestTravel) <= 0.01f && task.serial < next.serial))
+                    {
+                        next = task;
+                        bestTravel = travel;
+                    }
+                }
+                remaining.Remove(next!);
+                ordered.Add(next!);
+                cursor = next!.angel;
+            }
+        }
+
+        if (ordered.Select(t => t.serial).SequenceEqual(before))
+            return;
+
+        _taskQueue.Clear();
+        foreach (var task in ordered)
+            _taskQueue.Enqueue(task);
+        MelonLogger.Msg("[FCS Order] engagement sequence: " +
+            string.Join(" -> ", ordered.Select(t => $"#{t.serial}(P{t.priority} {t.angel:F0}deg)")));
     }
 
     private IEnumerator WaitForMatchCoalesceWindow()
