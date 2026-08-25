@@ -224,6 +224,81 @@ public class PurchaseDeck {
         yield return FcsRuntimeClock.WaitForSeconds(2f);
     }
 
+    /// <summary>
+    /// Buy any punchcard by id (shell or special card like ScoutPlane). If bearingDeg is
+    /// given, waits for the card's spawned console controls and sets the bearing dial,
+    /// verifying via the bridge's own value and correcting through its internal setter.
+    /// Caller must hold the Requisition lock. Reports the outcome through done().
+    /// </summary>
+    public IEnumerator BuyCardById(string cardId, float? bearingDeg, Action<string> done) {
+        if (_requisitionConsole == null) {
+            done("requisition console unbound");
+            yield break;
+        }
+
+        Transform? card = null;
+        var available = new List<string>();
+        foreach (var runtime in _requisitionConsole.GetComponentsInChildren<PunchcardRuntime>(true)) {
+            string? id = null;
+            try { id = runtime.CurrentDefinition?.ID; } catch { }
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            available.Add(id!);
+            var normalized = id!.Replace("SMOKE", "SMK").Replace("Shell", "").Trim();
+            if (string.Equals(id, cardId, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(normalized, cardId, StringComparison.OrdinalIgnoreCase)) {
+                card = runtime.transform;
+            }
+        }
+        if (card == null) {
+            done($"card '{cardId}' not found; available [{string.Join(", ", available)}]");
+            yield break;
+        }
+
+        yield return FcsRuntimeClock.WaitUntilFocused();
+        card.position = new Vector3(6.4814f, -2.4675f, -22.0968f);
+        var draggable = card.GetComponent<DraggableItem>();
+        if (draggable == null) {
+            done("card has no DraggableItem");
+            yield break;
+        }
+        draggable.MoveToSlot();
+        yield return FcsRuntimeClock.WaitForSeconds(0.6f);
+
+        if (bearingDeg is { } bearing) {
+            DialOdometerPunchcardBridge? bridge = null;
+            var waitUntil = Time.unscaledTime + 4f;
+            while (bridge == null && Time.unscaledTime < waitUntil) {
+                bridge = UnityEngine.Object.FindObjectOfType<DialOdometerPunchcardBridge>();
+                if (bridge == null)
+                    yield return FcsRuntimeClock.WaitForSeconds(0.25f);
+            }
+            if (bridge == null) {
+                done("card accepted but no bearing controls appeared (not a recon card?)");
+                yield break;
+            }
+            if (bridge.bearingDial != null)
+                bridge.bearingDial.SetDialValue(bearing);
+            yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+
+            var applied = float.NaN;
+            try { applied = bridge.Bearing; } catch { }
+            if (float.IsNaN(applied) || Mathf.Abs(Mathf.DeltaAngle(applied, bearing)) > 1f) {
+                try {
+                    bridge.SetBearingInternal(bearing, true);
+                    bridge.ForceRefreshAll();
+                    applied = bridge.Bearing;
+                }
+                catch { }
+            }
+            MelonLogger.Msg($"[FCS] card bearing requested {bearing:F1} applied {applied:F1}");
+            yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+        }
+
+        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
+        yield return FcsRuntimeClock.WaitForSeconds(2f);
+        done("ok");
+    }
+
     public IEnumerator BuyPowders() {
         if (_powderCard == null) {
             MelonLogger.Error("[FCS] BuyPowders: Can't find PowderCharges card in current physical requisition state");

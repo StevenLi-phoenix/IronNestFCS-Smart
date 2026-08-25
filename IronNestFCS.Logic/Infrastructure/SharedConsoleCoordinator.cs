@@ -4,6 +4,12 @@ using MelonLoader;
 
 namespace IronNestFCS.Logic.Infrastructure;
 
+/// <summary>External punchcard purchase request (e.g. scout plane), executed by the coordinator.</summary>
+public sealed class ConsoleCardRequest {
+    public string CardId = "";
+    public float? BearingDeg;
+}
+
 /// <summary>
 /// Owns serialization for the three physically distinct shared operator consoles.
 /// Per-gun reload/elevation work and the shared turret lane live in other modules.
@@ -40,6 +46,42 @@ internal sealed class SharedConsoleCoordinator {
         }
         finally {
             Trigger.Release();
+        }
+    }
+
+    private readonly Queue<ConsoleCardRequest> _cardRequests = new();
+
+    /// <summary>Latest completed card-request outcome, for external observers to poll.</summary>
+    public string LastCardRequestResult { get; private set; } = "";
+
+    public void EnqueueCardRequest(ConsoleCardRequest request) => _cardRequests.Enqueue(request);
+
+    /// <summary>
+    /// Drains externally submitted punchcard purchases inside the coordinator's own
+    /// Requisition-lock discipline — no external mod ever touches the console directly.
+    /// </summary>
+    public IEnumerator ConsoleCardRequestLoop() {
+        while (true) {
+            yield return FcsRuntimeClock.WaitForSeconds(1f);
+            if (_cardRequests.Count == 0) continue;
+            yield return FcsRuntimeClock.WaitUntilFocused();
+
+            var request = _cardRequests.Dequeue();
+            MelonLogger.Msg(
+                $"[FCS] console card request: {request.CardId}" +
+                (request.BearingDeg is { } b ? $" bearing {b:F1}掳" : ""));
+
+            yield return Requisition.Acquire();
+            try {
+                yield return FcsRuntimeClock.WaitUntilFocused();
+                yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, result => {
+                    LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
+                    MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
+                });
+            }
+            finally {
+                Requisition.Release();
+            }
         }
     }
 
