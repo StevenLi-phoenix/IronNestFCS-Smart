@@ -137,7 +137,6 @@ internal sealed class TaskDispatcher
         }
 
         var snapshot = _fcs.Planner.CaptureSnapshot();
-        var attempted = new HashSet<ArtilleryTask>();
         var planningResults = new List<TaskPlanningResult>();
         // Retry ownership belongs to a free transient gun side, not to whether a particular task had zero
         // candidates. A task may be eligible on Left while Right is still recovering; if Right opens during
@@ -145,13 +144,10 @@ internal sealed class TaskDispatcher
         var deferredPhysicalMask = SnapshotTransientFreeSideMask(snapshot);
         var admittedAny = false;
 
-        while (true)
+        // The eligibility scan is fully synchronous (no yields), so the queue cannot change
+        // under it — one snapshot copy is all the isolation it needs.
+        foreach (var task in _taskQueue.ToArray())
         {
-            var task = FindNextUnattempted(attempted);
-            if (task == null)
-                break;
-
-            attempted.Add(task);
             var result = _fcs.Planner.BuildEligibility(task, snapshot);
             planningResults.Add(result);
 
@@ -278,8 +274,8 @@ internal sealed class TaskDispatcher
 
         _planning = false;
 
-        if (!admittedAny && attempted.Count > 0)
-            MelonLogger.Msg($"[FCS Dispatch] planning round deferred {attempted.Count} pending task(s)");
+        if (!admittedAny && planningResults.Count > 0)
+            MelonLogger.Msg($"[FCS Dispatch] planning round deferred {planningResults.Count} pending task(s)");
 
         // Plans finish at physical shot, so preserve event-driven dispatch for any free side that was transient
         // in this round's snapshot. If it became plannable while materializing another assignment, immediately
@@ -367,23 +363,25 @@ internal sealed class TaskDispatcher
         return mask;
     }
 
+    // Table so every per-side rule is written once; the retry bitmask indexes into this.
+    private static readonly (int Bit, LeftRight Side, GunSide Gun)[] RetrySides =
+    {
+        (LeftPhysicalRetryBit, LeftRight.Left, GunSide.Left),
+        (RightPhysicalRetryBit, LeftRight.Right, GunSide.Right),
+    };
+
     private int CurrentPlannableFreeSideMask(int sideMask)
     {
         var mask = 0;
-        if ((sideMask & LeftPhysicalRetryBit) != 0
-            && _fcs.PlanExecutor.GetPlan(LeftRight.Left) == null
-            && IsPlannable(_fcs.Loading.GetSnapshot(GunSide.Left).PhysicalState))
+        foreach (var (bit, side, gun) in RetrySides)
         {
-            mask |= LeftPhysicalRetryBit;
+            if ((sideMask & bit) != 0
+                && _fcs.PlanExecutor.GetPlan(side) == null
+                && IsPlannable(_fcs.Loading.GetSnapshot(gun).PhysicalState))
+            {
+                mask |= bit;
+            }
         }
-
-        if ((sideMask & RightPhysicalRetryBit) != 0
-            && _fcs.PlanExecutor.GetPlan(LeftRight.Right) == null
-            && IsPlannable(_fcs.Loading.GetSnapshot(GunSide.Right).PhysicalState))
-        {
-            mask |= RightPhysicalRetryBit;
-        }
-
         return mask;
     }
 
@@ -406,34 +404,22 @@ internal sealed class TaskDispatcher
             {
                 yield return FcsRuntimeClock.WaitUntilFocused();
 
-                if ((_physicalRetryMask & LeftPhysicalRetryBit) != 0)
+                foreach (var (bit, side, gun) in RetrySides)
                 {
-                    if (_fcs.PlanExecutor.GetPlan(LeftRight.Left) != null)
-                    {
-                        _physicalRetryMask &= ~LeftPhysicalRetryBit;
-                    }
-                    else if (IsPlannable(_fcs.Loading.GetSnapshot(GunSide.Left).PhysicalState))
+                    if ((_physicalRetryMask & bit) == 0)
+                        continue;
+                    if (_fcs.PlanExecutor.GetPlan(side) != null)
+                        _physicalRetryMask &= ~bit; // side got a plan; its completion re-triggers dispatch by event
+                    else if (IsPlannable(_fcs.Loading.GetSnapshot(gun).PhysicalState))
                     {
                         shouldRetry = true;
                         break;
                     }
                 }
 
-                if ((_physicalRetryMask & RightPhysicalRetryBit) != 0)
-                {
-                    if (_fcs.PlanExecutor.GetPlan(LeftRight.Right) != null)
-                    {
-                        _physicalRetryMask &= ~RightPhysicalRetryBit;
-                    }
-                    else if (IsPlannable(_fcs.Loading.GetSnapshot(GunSide.Right).PhysicalState))
-                    {
-                        shouldRetry = true;
-                        break;
-                    }
-                }
-
-                if (!shouldRetry)
-                    yield return FcsRuntimeClock.WaitForSeconds(PhysicalRetryPollSeconds);
+                if (shouldRetry)
+                    break;
+                yield return FcsRuntimeClock.WaitForSeconds(PhysicalRetryPollSeconds);
             }
         }
         finally
@@ -460,16 +446,6 @@ internal sealed class TaskDispatcher
         || state == LoadingPhysicalState.Unknown
         || state == LoadingPhysicalState.Unbound;
 
-    private ArtilleryTask? FindNextUnattempted(HashSet<ArtilleryTask> attempted)
-    {
-        foreach (var task in _taskQueue)
-        {
-            if (!attempted.Contains(task))
-                return task;
-        }
-
-        return null;
-    }
 
     /// <summary>
     /// Commander-initiated cancellation of a PENDING task by its unique serial (#N) — the
