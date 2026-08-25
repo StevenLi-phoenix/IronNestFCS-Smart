@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
@@ -262,11 +262,28 @@ public class MapTable {
         if (Mathf.Abs(Mathf.DeltaAngle(task.angel, refreshed.angel)) > 0.05f
             || Mathf.Abs(task.distance - refreshed.distance) > 0.02f) {
             MelonLogger.Msg(
-                $"[FCS] T{task.targetId} solution refreshed: {task.angel:F1}掳/{task.distance:F2}km -> {refreshed.angel:F1}掳/{refreshed.distance:F2}km");
+                $"[FCS] #{task.serial} solution refreshed: {task.angel:F1}掳/{task.distance:F2}km -> {refreshed.angel:F1}掳/{refreshed.distance:F2}km");
         }
         task.angel = refreshed.angel;
         task.distance = refreshed.distance;
         task.position = refreshed.position;
+    }
+
+    // ---- Gun target markers ----
+    // T1/T2 are FCS-owned: T1 sits on the left gun's current aim, T2 on the right gun's,
+    // parked home when the gun has no task. T3+ belong to the player and are never touched.
+    private readonly Dictionary<int, Vector3> _gunMarkerHomes = new();
+
+    public void SetGunTargetMarker(int id, Vector3? aimLocal) {
+        if (!artilleries.TryGetValue(id, out var marker) || marker == null)
+            return;
+        if (!_gunMarkerHomes.TryGetValue(id, out var home)) {
+            home = marker.localPosition;
+            _gunMarkerHomes[id] = home;
+        }
+        var target = aimLocal is { } aim ? new Vector3(aim.x, aim.y, home.z) : home;
+        if ((marker.localPosition - target).sqrMagnitude > 1e-6f)
+            marker.localPosition = target;
     }
 
     /// <summary>
@@ -297,7 +314,7 @@ public class MapTable {
         task.aimLocal = aim;
         task.aimAdjusted = true;
         RefreshSolution(task);
-        MelonLogger.Msg($"[FCS] #{task.serial} (marker T{task.targetId}) aim adjusted by agent -> brg {task.angel:F1}deg, {task.distance:F2}km [{task.progress}]");
+        MelonLogger.Msg($"[FCS] #{task.serial} (marker #{task.serial}) aim adjusted by agent -> brg {task.angel:F1}deg, {task.distance:F2}km [{task.progress}]");
         return $"ok: #{task.serial} 已改瞄 -> 方位{task.angel:F1}°, 距离{task.distance:F2}km (当前阶段{task.progress})";
     }
 

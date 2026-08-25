@@ -80,14 +80,14 @@ internal sealed class TaskDispatcher
 
         // Intent-only queue: no gun/loading read here.
         _taskQueue.Enqueue(task);
-        MelonLogger.Msg($"[FCS Dispatch] queued #{task.serial} T{task.targetId} P{task.priority}; pending={_taskQueue.Count}");
+        MelonLogger.Msg($"[FCS Dispatch] queued #{task.serial} P{task.priority}; pending={_taskQueue.Count}");
 
         // Urgent task with both guns busy: try to hijack a matching-load gun before dispatching.
         // The preempted task re-enters this queue via EnqueueTask (its priority < urgent, so no recursion).
         if (task.priority >= UrgentPriorityThreshold && !_fcs.PlanExecutor.HasFreeGun
             && _fcs.PlanExecutor.TryPreemptForUrgent(task, out var preemptDetail))
         {
-            MelonLogger.Msg($"[FCS Dispatch] urgent T{task.targetId}: {preemptDetail}");
+            MelonLogger.Msg($"[FCS Dispatch] urgent #{task.serial}: {preemptDetail}");
         }
 
         TryDispatch();
@@ -160,7 +160,7 @@ internal sealed class TaskDispatcher
                 task.failureReason = "";
 
                 MelonLogger.Msg(
-                    $"[FCS Dispatch] T{task.targetId} remains pending; {result.FailureDetail}");
+                    $"[FCS Dispatch] #{task.serial} remains pending; {result.FailureDetail}");
             }
         }
 
@@ -209,7 +209,7 @@ internal sealed class TaskDispatcher
                         excludedEdges.Add(key);
                         rematchRequired = true;
                         MelonLogger.Warning(
-                            $"[FCS Match] materialization rejected T{assignment.Planning.Task.targetId}" +
+                            $"[FCS Match] materialization rejected #{assignment.Planning.Task.serial}" +
                             $"->{assignment.Candidate.Side} {assignment.Candidate.Shell.DisplayName()} " +
                             $"C{assignment.Candidate.Charge}: {failureReason}; rematching remaining edges");
                         break;
@@ -248,16 +248,16 @@ internal sealed class TaskDispatcher
                     task.pendingHint = PendingHint.None;
                     task.failureReason = "";
                     MelonLogger.Warning(
-                        $"[FCS Dispatch] T{task.targetId} matched FirePlan was not admitted and remains pending: {addReason}");
+                        $"[FCS Dispatch] #{task.serial} matched FirePlan was not admitted and remains pending: {addReason}");
                     continue;
                 }
 
                 if (!RemovePendingTask(task))
-                    MelonLogger.Warning($"[FCS Dispatch] admitted T{task.targetId} was no longer present in pending queue");
+                    MelonLogger.Warning($"[FCS Dispatch] admitted #{task.serial} was no longer present in pending queue");
 
                 selectedTasks.Add(task);
                 admittedAny = true;
-                MelonLogger.Msg($"[FCS Dispatch] admitted T{task.targetId}; pending={_taskQueue.Count}");
+                MelonLogger.Msg($"[FCS Dispatch] admitted #{task.serial}; pending={_taskQueue.Count}");
             }
         }
 
@@ -510,7 +510,7 @@ internal sealed class TaskDispatcher
         {
             var left = DescribeCandidate(result.LeftCandidate, result.LeftReason);
             var right = DescribeCandidate(result.RightCandidate, result.RightReason);
-            MelonLogger.Msg($"[FCS Match] T{result.Task.targetId}: Left={left}; Right={right}");
+            MelonLogger.Msg($"[FCS Match] #{result.Task.serial}: Left={left}; Right={right}");
         }
     }
 
@@ -533,7 +533,7 @@ internal sealed class TaskDispatcher
         var candidate = assignment.Candidate;
         var minimumCharge = BallisticCalculator.MinimumCharge(task.distance);
         var chargeExcess = Math.Max(0, candidate.Charge - minimumCharge);
-        return $"T{task.targetId}->{candidate.Side} {candidate.Shell.DisplayName()} C{candidate.Charge} " +
+        return $"#{task.serial}->{candidate.Side} {candidate.Shell.DisplayName()} C{candidate.Charge} " +
                $"(chargeExcess={chargeExcess})";
     }
 
@@ -643,7 +643,7 @@ internal sealed class TaskDispatcher
             return null;
         match.progress = Progress.Failed;
         match.failureReason = "cancelled by commander";
-        MelonLogger.Msg($"[FCS Dispatch] pending #{serial} T{match.targetId} cancelled by commander; pending={_taskQueue.Count}");
+        MelonLogger.Msg($"[FCS Dispatch] pending #{serial} cancelled by commander; pending={_taskQueue.Count}");
         return $"#{match.serial} {match.bulletType.DisplayName()} brg {match.angel:F1} dist {match.distance:F2}km";
     }
 
