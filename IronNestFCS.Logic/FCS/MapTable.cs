@@ -270,18 +270,15 @@ public class MapTable {
     }
 
     // ---- Gun target markers ----
-    // T1/T2 are FCS-owned: T1 sits on the left gun's current aim, T2 on the right gun's,
-    // parked home when the gun has no task. T3+ belong to the player and are never touched.
-    private readonly Dictionary<int, Vector3> _gunMarkerHomes = new();
-
+    // T1/T2 are FCS-owned: T1 sits on the left gun's current aim, T2 on the right gun's.
+    // After the shot they STAY PUT — the resting position shows the in-flight shell's
+    // planned impact point. Never parked home. T3+ belong to the player, never touched.
     public void SetGunTargetMarker(int id, Vector3? aimLocal) {
+        if (aimLocal is not { } aim)
+            return; // gun idle: leave the marker on the last planned impact point
         if (!artilleries.TryGetValue(id, out var marker) || marker == null)
             return;
-        if (!_gunMarkerHomes.TryGetValue(id, out var home)) {
-            home = marker.localPosition;
-            _gunMarkerHomes[id] = home;
-        }
-        var target = aimLocal is { } aim ? new Vector3(aim.x, aim.y, home.z) : home;
+        var target = new Vector3(aim.x, aim.y, marker.localPosition.z);
         if ((marker.localPosition - target).sqrMagnitude > 1e-6f)
             marker.localPosition = target;
     }

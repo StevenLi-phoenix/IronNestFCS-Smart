@@ -206,8 +206,8 @@ public class FSC
 
     /// <summary>
     /// T1/T2 are FCS-owned gun target markers: T1 tracks the left gun's current aim, T2 the
-    /// right gun's, parked home when that gun is idle. Physical-state sync — polling is the
-    /// honest mechanism (the aim moves with tracking/re-aims). T3+ stay player-owned.
+    /// right gun's. After the shot they stay put — the resting marker shows the in-flight
+    /// shell's planned impact point until the next task moves it. T3+ stay player-owned.
     /// </summary>
     private IEnumerator GunTargetMarkerLoop()
     {
