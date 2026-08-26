@@ -1,11 +1,13 @@
-# IronNestFCS-Smart 增强需求规格 v2(clean-house 重实现)
+# IronNestFCS-Smart 增强需求规格 v3(clean-house 重实现)
 
 本文档是对既有 smart-fdc 增强(36 个开发 commit)的**完整需求提炼**。重实现者以本文档
 和上游 baseline 代码(origin/master)为唯一输入,**禁止阅读旧实现的 diff 或 master 分支**。
 文中给出的字符串(日志、错误消息、UI 文本)是**规范本体**,逐字使用;数值常量同理。
 
-**v2 说明**:本版把一轮逐模块审计(91 条发现)的修正全部融入正文。总原则是**忠实旧行为**:
-凡规格与旧实现不符处,一律以旧实现为准修订规格。仅有三处例外,均在正文相应位置显式声明:
+**v3 说明**:本版在 v2(已融入一轮逐模块审计的 91 条发现)基础上,再融入**第二轮审计的
+41 条发现**——本轮多为**时序/日志先后/门限判据/参数实参**的精化,一律照单收录。总原则不变,
+仍是**忠实旧行为**:凡规格与旧实现不符处,一律以旧实现为准修订规格。仅有三处例外,均在正文
+相应位置显式声明:
 
 1. **编码**(§0、附录 C):所有 `°` 一律是 U+00B0,中文一律是正确中文。旧实现日志里出现的
    `掳` 是源文件丢 BOM 后被按 GBK 重解码的编码事故,**不要复现**。
@@ -24,6 +26,9 @@
 - **每次 `yield return` 之后必须重查计划存活性**,但**存活性谓词按阶段不同**,不是一个统一
   三联式:未取得共享方位所有权的准备阶段(装填、pre-aim)**不得**把 `_current == plan` 纳入
   存活性判定,否则同批搭档的计划会在装填完成后立即 `yield break`。逐阶段谓词见 §8 与 §18.1。
+  该不变量有**三条具名例外**(见 §18.1,不是疏漏):**准备阶段例外**(§8.0/§8.3)、
+  **`GunTargetMarkerLoop` 例外**(§13)、**`ResolveElevation` 台解例外**(§8.1)——后者是
+  「一旦进入必须跑完、其 7 处 `yield return` 后**完全不做**任何存活性检查」。
 - 公开 API 的类型名、成员名、签名必须与 §17 兼容性契约完全一致(外部 mod 通过反射调用)。
 - 新代码写进 baseline 对应文件;可以自由改善内部结构,但不改 baseline 已有公开面。
 - **源文件编码(硬纪律)**:所有含非 ASCII 字面量的 `.cs` 文件必须保存为 **UTF-8 with BOM**。
@@ -108,16 +113,20 @@
   `outputRangeMin/Max`、`MapDialValueToSymbolIndex(value)`、`dial`),字母盘父物体名含
   `"Location L"`,数字盘含 `"Location N"`。
 - 地图实体:fire-mission root 子物体上的 `EntityLocation` 组件(`.Entity` → `MapEntity`,
-  有 `ID`/`RawID`/`IsAlive`)。
-- **可见性定义(不是合取式,照字面读会全判成迷雾)**:
+  有 `ID`/`RawID`/`IsAlive`)。**`VisualRoot` 与 `VisibilityGroup` 是 `EntityLocation`
+  组件实例(下文的 `loc`)的成员,不是 `MapEntity` 的成员**;只有 `IsAlive` 取自
+  `loc.Entity` 返回的 `MapEntity`(下文的 `entity`)。
+- **可见性定义(不是合取式,照字面读会全判成迷雾;宿主类型是规范的一部分)**:
 
-  ```
-  visible = VisualRoot != null && VisualRoot.activeInHierarchy;
-  if (visible && VisibilityGroup != null) visible = VisibilityGroup.alpha > 0.05f;
+  ```csharp
+  alive   = entity.IsAlive;                                            // MapEntity
+  visible = loc.VisualRoot != null && loc.VisualRoot.activeInHierarchy; // EntityLocation
+  if (visible && loc.VisibilityGroup != null)
+      visible = loc.VisibilityGroup.alpha > 0.05f;                      // EntityLocation
   ```
 
   即 `VisibilityGroup` 为 **null 的实体算可见**(不降低可见性);激活判定必须精确到
-  `activeInHierarchy`,**不是** `activeSelf`。
+  `activeInHierarchy`,**不是** `activeSelf`。三步的**求值顺序与 try 块边界**见 §7.2。
 - 装填失败时 baseline 产生的失败原因文本(是 §9 R7 恢复逻辑的触发器,不得改动 baseline 措辞):
   - 装药不符:`powder commit mismatch: expected C{n}, physical C{m}`(正则捕获两个数字);
   - 供药机暂时不可用:reason 含子串 `powder dispenser`。
@@ -158,7 +167,12 @@ baseline 既有字段 `chargeCount`(int,已提交/已装装药,0 = 未定)同样
 - `hasMotion || trackEntityId.Length > 0` → **运动分支**。即 `trackEntityId` 非空时,
   即使 `hasMotion` 仍为 false(第一次采样只存样本 vel=0、或目标一直在雾中从未采到样),
   也走运动分支;此时 vel 为零向量,速度算得 0 < 0.5 km/h,输出 `" · 跟踪 {id}(静止)"`。
-- 运动分支内:速度 = `|vel| × 3.8164 × 3600` km/h;航向 = `atan2(vel.x, vel.y)` 转 0–360°。
+- 运动分支内:速度 = `motionVelLocalPerSec.magnitude × 3.8164f × 3600f` km/h
+  ——**`Vector3` 完整模长(含 z),不是 §7.3/§7.5 的水平 `Vector2` 口径**;
+  航向仍**只用 x/y**:`Mathf.Atan2(vel.x, vel.y)` 转 0–360°。
+  两个口径在此不可互换:`motionVelLocalPerSec` 是 §17 冻结的公开字段,外部桥/LLM 可以直接
+  写入非零 z(只有 FCS 自己的 `UpdateEntityMotion` 会把 z 清零),按水平口径读会同时改变
+  上报的 km/h 与是否落进 `< 0.5f` 的「静止」分支。
   头部:跟踪时(`trackEntityId` 非空)`跟踪 {id}` / `track {id}`,否则 `运动模型` / `motion`;
   `trackingLost` 追加 `·失联外推` / `·extrapolating`;
   - 速度 < 0.5 km/h → `" · {头部}(静止){lost}"` / `" · {head}(static){lost}"`
@@ -185,6 +199,24 @@ baseline 既有字段 `chargeCount`(int,已提交/已装装药,0 = 未定)同样
 - 可取消变体 `Acquire(Func<bool> shouldCancel, Action onAcquired)`(≡ priority 50)与
   `Acquire(shouldCancel, onAcquired, int priority)`:等待期间与真正占锁前都要再查
   `shouldCancel`(锁释放与本协程恢复之间可能发生 F9/取消);只有真取到锁才回调。
+- **两个可取消重载与 `Acquire(int)` 完全同构,同样参与优先级票队**(这一条必须显式写:
+  baseline 的可取消重载是朴素的 `while (_held) { … }`,照抄它可以逐句满足上面那条,却会让
+  任何可取消 acquire 插队越过已排队的 P90 等待者,并使 `int priority` 参数彻底失效):
+  同样 `var seq = _ticketSeq++;` 登记票、同样在 `finally` 中 `_waiters.Remove(ticket)`
+  (**取消路径也不得泄漏票**),等待条件同为 `_held || !IsNext(priority, seq)`。循环体逐字为
+
+  ```csharp
+  while (_held || !IsNext(priority, seq))
+  {
+      if (shouldCancel())
+          yield break;
+      yield return null;
+  }
+  ```
+
+  ——`shouldCancel()` 在每次 `yield return null` **之前**检查(入口即取消时**不产生任何
+  yield**);循环退出后**再查一次** `shouldCancel()`,然后 `_held = true; onAcquired();`。
+  `onAcquired()` 在 try 块内调用,即**在移除票之前**。
 - `Reset()` 清 `_held` **和全部等待票**(热重载残留防死锁)。
 - 四个 `Acquire` 重载**全部保留**(忠实旧实现)。由此产生的外部反射歧义(无参
   `GetMethod("Acquire")` 抛 `AmbiguousMatchException`)记在 §17,**不在 FCS 侧加别名方法**。
@@ -198,8 +230,20 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 
 **目标:高优先级任务在"抢炮、开火顺序、跨批次执行顺序"三个层面都优先。**
 
-### 5.1 配位比较(`TaskGunMatcher.CompareSolutions`)
+### 5.1 配位比较(`TaskGunMatcher.Compare`)
 
+- **插入宿主方法的精确名字与签名**:baseline 里**没有** `CompareSolutions` 这个成员;要改的是
+  `IronNestFCS.Logic/Scheduling/TaskGunMatcher.cs` 的私有静态方法
+
+  ```csharp
+  private static int Compare(IReadOnlyList<TaskGunAssignment> a,
+                             IReadOnlyList<TaskGunAssignment> b,
+                             Dictionary<TaskPlanningResult, int> queueRanks)
+  ```
+
+  (其自带注释为 `// Negative means a is the better solution.`,即**返回负数 = a 更优**)。
+  新比较插进的是这个 `Compare`,**不是** `CompareSolutions`——照后者去 baseline 里搜会搜不到,
+  从而凭空发明新方法或把比较挂到错误位置。
 - 新增一个**独立的私有静态比较方法**(规范名 `CompareExplicitPriority(a, b)`)。它与 baseline
   既有的 `CompareTaskPriority(IReadOnlyList<TaskGunAssignment>, IReadOnlyList<TaskGunAssignment>, …)`
   是**两个不同的比较**——后者位于比较链更靠后的位置、做的是别的事,**保持原样、原位置不动**。
@@ -207,14 +251,33 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 - **插入位置精确**:`if (a.Count != b.Count) return b.Count.CompareTo(a.Count);` 之后的
   **第一条**比较,**位于 baseline 的「同一任务:已装填炮 vs 空炮」(LoadedReady)单任务例外
   判断之前**。放到例外之后会让紧急任务在某些配位上仍输给代价模型。
-- 语义:两方案各取任务 priority 降序向量做字典序比较,更紧急者胜。返回值约定与
-  `CompareSolutions` 一致(负数 = a 更优),**相等返回 0 继续向下走原比较链**
+- 语义:两方案各取任务 priority 降序向量做字典序比较,更紧急者胜。返回值约定与宿主
+  `Compare` 一致(负数 = a 更优),**相等返回 0 继续向下走原比较链**
   (普通任务全是 50,该比较自然中立)。
 
 ### 5.2 同批比对(`FirePriorityCoordinator.ComparePair`)
 
 - priority 不同 → 高者先打,`reason = $"priority P{first.Task.priority} over P{second.Task.priority}"`;
   相同才走 ETA/对齐逻辑。
+- **新判据必须实现为 `ComparePair` 里 `if/else if/else` 链的第一个 `if` 分支**,即
+
+  ```csharp
+  if (a.Task.priority != b.Task.priority) { … }
+  else if (a.EtaKnown && b.EtaKnown)      { … }   // baseline ETA 分支
+  else                                    { … }   // baseline 对齐分支
+  ```
+
+  priority 分支内**不得**调用 `RefreshEstimatedReadyAt`——baseline 的 ETA 分支带副作用
+  (`var comparisonAt = FcsRuntimeClock.Now; var aReadyAt = a.RefreshEstimatedReadyAt(comparisonAt);
+  var bReadyAt = b.RefreshEstimatedReadyAt(comparisonAt);`),走 priority 分支时**两个计划的
+  `EstimatedReadyAt` 都保持规划时刻的值**,`DetailForSide` 里的 `计划ETA {eta:F1}s`
+  (= `EstimatedReadyAt − Now`)与执行期对 `EstimatedReadyAt` 的一切使用随之不同。
+  「无条件先刷 ETA、再用 priority 覆盖排序」能满足上一条的字面,却产生不同的 HUD 明细文本
+  与不同的 `EstimatedReadyAt` 状态。
+- priority 分支体逐字为
+  `first = a.Task.priority > b.Task.priority ? a : b; second = ReferenceEquals(first, a) ? b : a;`,
+  随后**共用 baseline 的公共尾段**(分配 `ExecutionBatchId`、`a.Compared = b.Compared = true`、
+  `UpdateDetails(a, b)`、写 `_statusText`、打配对日志、`return first`)。
 - 该 reason **直接以原文**内插进配对日志
   `[FCS Order] batch {executionBatchId} paired once: {first.Label} first, {second.Label} second; {reason}`,
   **不经 `FcsLocalization.LogReason` / `UiReason`**(映射表里没有这个 key,套本地化会被改写或返空);
@@ -239,6 +302,19 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 
   这些行**不在附录 C**(附录 C 只收关键新增行);替换规则本身就是它们的规范。
 
+- **替换规则的例外(唯一一处,必须保持 baseline 原样)**:`FcsModule.BuildDiagnosticContext`
+  内的本地函数
+
+  ```csharp
+  static string TaskContext(ArtilleryTask? task) => task == null ? "-" : $"T{task.targetId}:{task.progress}";
+  ```
+
+  **不替换为 `#{serial}`**——`FcsDiagnosticLog` 的 `gen={n} | L=… | R=…` 上下文串**仍以
+  `T{targetId}` 标识任务**。替换的作用域是
+  `FirePlanExecutor` / `FirePlanner` / `FirePriorityCoordinator` / `TaskDispatcher` /
+  `TaskGunMatcher` / `FirePlan.Label` / `FcsWindow` 这七处,**`FcsModule.cs` 不在其内**
+  (旧实现即未改动该文件)。「全量替换」不得读成「全仓 grep 替换」。
+
 ### 5.3 跨批次执行顺序(`FirePlanExecutor.EvaluateScheduling`)
 
 - **适用范围限定**:整段重排只在 baseline 前置门 `if (_current != null) return;` 通过时才评估
@@ -248,7 +324,11 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 - **override 分支(唯一会打 priority override 日志的分支)**:当且仅当
   `other is { Compared: false } && other.Task.priority > committed.Task.priority`:
   `FirePriority.CommitSingle(other, "优先级高于已提交计划")`;先 `_next = committed`,
-  再 `SetCurrent(other, promote: false)` 并 `return`。日志逐字:
+  再 `SetCurrent(other, promote: false)` 并 `return`。
+  **日志的打印位置是规范的一部分**:override 行在 `CommitSingle` **返回之后**、
+  `_next = committed` **之前**打印。这一先后可观测——`FirePriorityCoordinator.CommitSingle`
+  自己会打 `[FCS Order] batch {ExecutionBatchId} single committed: {plan.Label}; {FcsLocalization.LogReason(reason)}`,
+  若先打 override 行再调 `CommitSingle`,两行 `[FCS Order]` 的顺序就颠倒了。日志逐字:
 
   ```
   [FCS Order] priority override: {other.Label} (P{other.Task.priority}) fires before committed {committed.Label} (P{committed.Task.priority})
@@ -273,7 +353,26 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 
 1. `if (task.serial == 0) task.serial = ++_serialCounter;`
 2. `if (task.firstEnqueuedAt == 0f) task.firstEnqueuedAt = FcsRuntimeClock.Now;`
-3. 复位 baseline 字段:`progress = Pending`、`pendingHint = None`、`startedAt = FcsRuntimeClock.Now`。
+3. 复位 baseline 的**整块**字段,**顺序与 baseline 一致、一行不删**:
+
+   ```csharp
+   task.progress   = Progress.Pending;
+   task.pendingHint = PendingHint.None;
+   task.startedAt  = FcsRuntimeClock.Now;
+   task.completedAt = 0f;
+   task.failureReason = "";
+   task.chargeCount = 0;
+   task.elevation   = 0f;
+   task.dispatchExcludedGunMask = 0;
+   ```
+
+   后五行 baseline 已有、本次不改动,但**必须逐字保留**,不是可有可无的:重入队路径
+   (§5.5 抢占退回、§9 `DetachForRequeue` 装填恢复退回、§9 清膛倾泻后原任务重入队)全靠
+   `chargeCount = 0` 清掉「已提交装药」,否则 §14.2 `AdjustAim` 的 `onGun && chargeCount > 0`
+   分支、FirePlanner 的装药匹配、§5.5 抢占候选排除条件(`已装装药 < MinimumCharge`)都会读到
+   陈旧装药;`elevation = 0f` 同样是 §8.4
+   `appliedElevation = plan.Task.elevation > 0f ? … : plan.Elevation` 的前提。
+   按「精确七步」的字面把这块压缩成三行会产生**静默的行为分岔**。
 4. `_taskQueue.Enqueue(task);`
 5. `MelonLogger.Msg($"[FCS Dispatch] queued #{task.serial} P{task.priority}; pending={_taskQueue.Count}");`
 6. **才**做紧急抢占尝试(此时紧急任务**已在队列里**;被抢占的 victim 通过嵌套 `EnqueueTask`
@@ -302,7 +401,19 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
   相同时**选左炮**。
 - 无候选/有空炮时返回 false 并给 detail
   (`"a gun is already free"` / `"no preemptable plan (current/armed, higher priority, or shell/charge mismatch)"`)。
-- 得手:`CancelPreparation(victim)`;victim 计划标 Failed,FailureReason =
+- 得手(**步骤顺序可观测,日志排在最前**):选出 victim 之后、**任何清理动作之前**先打
+
+  ```csharp
+  MelonLogger.Msg(
+      $"[FCS Plan] {victim.Label} preempted by urgent #{urgent.serial} P{urgent.priority} " +
+      $"(load {victim.Shell.DisplayName()} C{victim.Charge} transfers; min required C{requiredCharge})");
+  ```
+
+  ——它必须出现在 victim 的嵌套 `EnqueueTask` 所产生的
+  `[FCS Dispatch] queued #{victim.serial} P{p}; pending={n}` **之前**,也必须在调用方随后打的
+  `[FCS Dispatch] urgent #{urgent.serial}: preempted {victim.Label}` **之前**。把它挪到
+  `detail = …` 附近(方法末尾)会让这三行的先后颠倒。
+- 打完日志后:`CancelPreparation(victim)`;victim 计划标 Failed,FailureReason =
   `"preempted by urgent task"`;若是 fireWaitOwner 则 `ClearAllFireWait()`;
   `ReleaseGunSlot(victim, notify:false)`;**victim 的任务不算失败**:progress 复位
   Pending、failureReason 清空、pendingHint 清空,重新 `EnqueueTask`(serial 不变;其
@@ -325,7 +436,12 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
   if (turretMapModel != null) return turretMapModel.localPosition;  // 完整 Vector3,含 z
   ```
 
-  这样棋子晚于场景绑定生成也能被后续调用捡到;**只有 Find 成功那一次打日志**。
+  这样棋子晚于场景绑定生成也能被后续调用捡到。
+- **绑定日志的条件是「本次调用里 `turretMapModel == null` 且 `mapSurface.Find` 返回非 null」,
+  不是「进程内只打一次」**:实现里**没有任何**「已打印过」标志。因此场景重载导致缓存的
+  Transform 被销毁(Unity 的 `== null` 为真)后重新 Find 成功时,该行会**再次**打印。
+  规范原文:「每次惰性 Find 成功都打印一次绑定行;Find 失败(返回 null)不打印;**不得**用
+  `_originLogged` 一类标志抑制后续重绑定的打印。」
 - 未命中才走 baseline 的 `turretLocation` 反变换分支;该分支在
   `turretLocation == null || mapSurface == null` 时返回 `Vector3.zero`。
 - 返回值是**完整 Vector3(含 z)**,不是水平投影。
@@ -375,10 +491,33 @@ _fcs.MapTable.RefreshSolution(pending);
 - 世界时钟分支的返回条件是**缓存非空且读数为正**:
   `if (_worldClock != null && _worldClock.CurrentTime > 0f) return _worldClock.CurrentTime;`
   ——读数 ≤ 0(时钟对象存在但未启动)只是**跳过该分支**下落到秒表,**不清缓存、不重新扫描**。
-- 扫描触发条件是 `_worldClock == null`(**只扫一次**,满足 §18.5 的缓存要求);多个
-  `GenericTimerSceneSync` 取 `CurrentTime` 最大者并缓存。
+- 扫描触发条件是 `_worldClock == null`——**每次求值时若缓存仍为 null 就重扫一遍**
+  `UnityEngine.Object.FindObjectsOfType<GenericTimerSceneSync>()`,多个取 `CurrentTime`
+  最大者并缓存;**只有扫到对象之后才不再扫**。**不得**引入 `_scanAttempted` 一类
+  「已扫描过」标志来抑制重扫(那会让晚于首次调用才生成的世界时钟**永远**不被拾取,
+  `MissionNow` 永久退到 `Time.realtimeSinceStartup` 这个**另一个时间基准**,运动模型的
+  t0/horizon 全体改变)。这是 §18.5「禁止每帧 FindObjectsOfType」的**具名例外**:
+  缓存命中后不再扫描即已满足该不变量,未命中时的重扫是规范行为。
 - **仅当 try 块访问抛异常**时 `_worldClock = null`,触发下次重扫。
-- 依次退 `MissionStatsTracker.Instance.timerRunning ? timerValue`,再退 `Time.realtimeSinceStartup`。
+- 秒表兜底分支的**结构**同样是规范:
+
+  ```csharp
+  try
+  {
+      var tracker = MissionStatsTracker.Instance;
+      if (tracker != null && tracker.timerRunning)
+          return tracker.timerValue;
+  }
+  catch { }
+  return Time.realtimeSinceStartup;
+  ```
+
+  四点缺一不可:(a) **有 `tracker != null` 显式判空**;(b) 整块包在**第二个独立的
+  try/catch** 里;(c) 该 catch 是**空 catch,不清 `_worldClock`**(与世界时钟那块的
+  `catch { _worldClock = null; }` 不同);(d) 未运行或抛异常都落到
+  `return Time.realtimeSinceStartup;`。缺 (a)(b) 时 `Instance` 为 null 会让 NRE 冒出
+  `MissionNow`,击穿每一个调用点(规划轮、`ApplyMotionModel`、`UpdateEntityMotion`);
+  缺 (c) 会误清世界时钟缓存、触发无谓重扫。
 
 ### 7.2 `public void UpdateEntityMotion(ArtilleryTask task)`
 
@@ -391,10 +530,67 @@ _fcs.MapTable.RefreshSolution(pending);
   ```
 
   即 `hasMotion == false` 时把 `trackingLost` 显式清成 false。
-- 在 fire-mission root 的子物体里找 `EntityLocation`,其 Entity 的 `ID` 或 `RawID`
-  等于 `trackEntityId`。Il2Cpp 属性访问全部 try/catch,**局部变量初值为
-  `bool visible = false, alive = true;`**——即**异常等价于「进入迷雾」**,走保留旧模型的路径,
-  而不是清空模型或抛出。
+- **遍历范围:只遍历 fire-mission root 的直接子物体,不递归**:
+
+  ```csharp
+  for (var i = 0; i < fireMissionRoot.childCount; i++)
+  {
+      var child = fireMissionRoot.GetChild(i);
+      var loc = child.GetComponent<EntityLocation>();   // GetComponent,不是 GetComponentInChildren
+      if (loc == null) continue;
+      …
+  }
+  ```
+
+  **不得**改用 `fireMissionRoot.GetComponentsInChildren<EntityLocation>(true)`:那会命中挂在
+  孙层的组件,且采样点会变成该组件所在 transform 而非直接子物体,采出的局部坐标随之改变。
+  **采样坐标一律取该直接子物体的 `child.position`**。
+- **遍历体的逐级跳过规则(异常的作用域是逐级的,不是一句「异常等价于进入迷雾」)**——
+  只有 alive/visible 那一段的异常才导致 fog-return,读 `loc.Entity` 与读 `ID`/`RawID` 的
+  异常都只是 **`continue` 到下一个子物体**,扫描继续进行,后面的子物体仍可能命中并刷新模型:
+
+  ```csharp
+  var loc = child.GetComponent<EntityLocation>();
+  if (loc == null) continue;
+
+  MapEntity? entity = null;
+  try { entity = loc.Entity; } catch { }
+  if (entity == null) continue;                    // Entity 为 null 或取 Entity 抛异常 → continue,不是 return
+
+  string? id = null, rawId = null;
+  try { id = entity.ID; rawId = entity.RawID; } catch { }   // ID 与 RawID 共用同一个 try
+  if (id != task.trackEntityId && rawId != task.trackEntityId) continue;
+  ```
+
+  `ID` 与 `RawID` **共用同一个 try**——`ID` 抛异常时 `rawId` 保持 null。把这些异常也做成
+  「保留旧模型 return」,会让一个坏子物体**永久遮蔽**真正的被跟踪实体。
+- **id 比较口径**:`trackEntityId` 与 `Entity.ID` / `Entity.RawID` 的比较是 C# `string` 的
+  **序数、大小写敏感**相等(`!=` / `==`),**不使用** `OrdinalIgnoreCase`;二者任一相等即命中。
+  (§2/§15.4 的卡片 id 比较用 `OrdinalIgnoreCase`,**不要**把那个口径带过来。)
+- **命中即止**:遍历按子物体索引升序,**第一个** id 或 RawID 命中者即生效;命中后无论走的是
+  fog/dead 的 `return`、还是走完采样与 `motionOriginLocal`/`motionT0`/`hasMotion`/`trackingLost`
+  赋值后的 `return`,**都立即结束整个方法**,不再继续遍历后续子物体——**不 break 后继续、
+  不取最后一个命中者**。(这一条必须显式写:§15.4 的买卡扫描规定的恰恰相反——
+  「命中后不 break,最后一个命中者胜出」,极易被照搬。)
+- **alive/visible 的 try 块边界与块内求值顺序**(两者都可观测):三步求值包在**同一个**
+  try/catch 里,顺序固定,catch 为空;局部变量初值为 `bool visible = false, alive = true;`:
+
+  ```csharp
+  bool visible = false, alive = true;
+  try
+  {
+      alive   = entity.IsAlive;
+      visible = loc.VisualRoot != null && loc.VisualRoot.activeInHierarchy;
+      if (visible && loc.VisibilityGroup != null)
+          visible = loc.VisibilityGroup.alpha > 0.05f;
+  }
+  catch { }
+  if (!visible || !alive) return;
+  ```
+
+  即**异常等价于「进入迷雾」**,走保留旧模型的路径,而不是清空模型或抛出。若拆成两个独立
+  try(或把 visible 求值放在 alive 之前),`IsAlive` 抛异常时会得到 `alive = true` 且
+  `visible = true`,于是继续采样并刷新模型——与旧实现相反。
 - 三条「静默返回、保留旧模型继续外推」的路径(战争迷雾语义),行为一致但成因不同:
   1. 实体不可见(§2 可见性定义);
   2. 实体已死;
@@ -508,6 +704,13 @@ pre-aim 若加上 `_current == plan`,**每一个与搭档同批的计划都会�
     `SetDistance(plan.Task.distance)` / `SetDirection(plan.Task.angel)` / `SetCharge(plan.Charge)` /
     `SetShellType(plan.Task.bulletType)` → `Calculate` → `GetElevation`;
     `Ok = LastCalculationSucceeded && 有限`。
+  - **【§18.1 不变量 1 的第三条具名例外】`ResolveElevation` 及其台解回退**在其 7 处
+    `yield return`(`Ballistic.Acquire`、`WaitUntilFocused`、`SetDistance`/`SetDirection`/
+    `SetCharge`/`SetShellType`、`Calculate`)之后**完全不做任何存活性检查**——计划中途失活
+    也把整段台解跑完(**锁靠 `try/finally` 释放**),存活性一律交由调用方在
+    `yield return ResolveElevation(...)` **返回之后**按 §8.0 的分阶段谓词检查。
+    照 §18.1 字面在台解协程里插存活检查并提前 `yield break`,会导致弹道台被提前释放、
+    台面参数半写、`result.Ok` 保持 false 而调用方**无法区分「失活」与「台解失败」**。
 
 ### 8.2 触发条件三联与日志时序
 
@@ -521,11 +724,36 @@ pre-aim 若加上 `_current == plan`,**每一个与搭档同批的计划都会�
 ### 8.3 阶段 1 pre-aim(装填完成后、`Progress.Aiming` 大幅摇仰角之前)
 
 `ApplyMotionModel(task, 45)` + `RefreshSolution`;`ResolveElevation`(锁优先级 = 任务
-priority);存活检查(§8.0,仅 `!IsActive(plan)`);仰角差 > 0.05° 才采用:更新本次要摇到的
-仰角并写回 `task.elevation`,日志
-`pre-aim elevation refresh {旧:F2}° -> {新:F2}° (analytic|console)`。
-之后 `gun.SetElevation(采用值)`;失败消息用采用值。
-(与阶段 2/3 对比:**pre-aim 之后 `gun.LastElevationSucceeded` 为假会 `FailPlan`**。)
+priority);存活检查(§8.0,仅 `!IsActive(plan)`)。
+
+- **采用条件是两项合取,`Ok` 门不可省**:
+
+  ```csharp
+  if (aimSolve.Ok && Mathf.Abs(aimSolve.Elevation - aimElevation) > TrackElevationEpsilonDegrees)
+  ```
+
+  台解失败时 `SolveElevationForLoadedCharge` **仍会**把 `GetElevation()` 的返回值写进
+  `result.Elevation`(只是 `Ok = false`),该值可能是一个有限的陈旧/错误角度。漏掉 `Ok`
+  就会把废解当作新仰角打印日志、写回 `task.elevation` 并据此摇炮。
+  **`Ok` 为假时既不打日志、也不改 `aimElevation` 与 `task.elevation`,直接以 `plan.Elevation`
+  继续摇仰角。**(§8.4/§8.5 都显式写了 `Ok` 门,此处同构,不是刻意不同。)
+- 成立则采用:更新本次要摇到的仰角并写回 `task.elevation`,日志
+  `pre-aim elevation refresh {旧:F2}° -> {新:F2}° (analytic|console)`。
+- **整块 pre-aim 刷新(含可能长时间等待弹道台锁 + `WaitUntilFocused` + 台解)位于
+  `plan.Task.progress = Progress.Aiming;` 赋值之前**——刷新期间任务 progress 仍保持装填阶段
+  的值;赋值与 `gun.SetElevation(采用值, ElevationTimeoutSeconds)` 紧邻:
+
+  ```csharp
+  /* …pre-aim 刷新块整体在此… */
+  plan.Task.progress = Progress.Aiming;
+  yield return gun.SetElevation(采用值, ElevationTimeoutSeconds);
+  ```
+
+  本节标题「装填完成后、`Progress.Aiming` 大幅摇仰角之前」**不得**读成「先置
+  `Progress.Aiming` 再刷新」:该差异对外可见——`progress` 是 §17 冻结的反射面,外部桥每
+  2 秒读 `LeftTask`/`RightTask` 的 `progress.ToString()` 报给 agent、并进 HUD 文本。
+- 失败消息用采用值。
+  (与阶段 2/3 对比:**pre-aim 之后 `gun.LastElevationSucceeded` 为假会 `FailPlan`**。)
 
 ### 8.4 阶段 2 pre-fire(粗对齐完成后、进入扳机流程之前)
 
@@ -551,6 +779,13 @@ priority);存活检查(§8.0,仅 `!IsActive(plan)`);仰角差 > 0.05° 才采用
   `Ok` 时先更新 `appliedDistance = task.distance`;新旧仰角差 > 0.05° 才打日志 +
   `SetElevation`(用 `ElevationTimeoutSeconds`),且**仅在 `gun.LastElevationSucceeded` 为真时**
   才更新 `appliedElevation` 并写回 `task.elevation`,失败则两者都保持原值。
+- **修正日志里的误差米数必须是门限判定时捕获的值,不能在日志处现算**:附录 C 的
+  `pre-fire elevation correction {旧:F2}° -> {新:F2}° (range error {m:F0}m)` 中,
+  `m = 触发本次纵向修正的 rangeErrorKm × 1000f`,而 `rangeErrorKm` 是**更新前**的
+  `|task.distance − appliedDistance|`。因为上一条要求「`Ok` 时**先**更新
+  `appliedDistance = task.distance`」再判仰角差、再打日志,若在日志处现算
+  `|task.distance − appliedDistance| * 1000`,结果**恒为 0**,会逐字输出 `(range error 0m)`。
+  横向同理取 `crossErrorKm × 1000f`(横向因 `appliedAzimuth` 在日志之后才更新,无此风险)。
 - **pre-fire 阶段的仰角/方位修正失败不得调用 `FailPlan`、不得把计划标失败**;修正失败仅放弃
   本次修正,流程继续进入扳机阶段。(与阶段 1 pre-aim 形成对比。)
 - 每步 yield 后都做完整三联存活检查,失活直接 `yield break`。
@@ -562,13 +797,46 @@ priority);存活检查(§8.0,仅 `!IsActive(plan)`);仰角差 > 0.05° 才采用
   **不是**进入即先重调一次);且 `nextRelay` 在重调块**开头**就重新置为
   `FcsRuntimeClock.Now + TrackRelayIntervalSeconds`(节拍从块开始计,而不是从重调完成计,
   重调耗时被计入间隔内)。
+- **重调块在循环体内的位置**:整块位于 fire-wait 等待循环体的**末尾**——在**全部既有退出检查
+  之后**(击发观测、自动击发截止、resume-generation 等退出分支),在收尾的
+  `yield return FcsRuntimeClock.WaitForSeconds(0.1f)` **之前**:
+
+  ```csharp
+  while (…)
+  {
+      …既有的击发观测 / 自动击发截止 / resume-generation 等退出分支(内含 yield break)…
+
+      // ↓ 重调块在此
+      if (FcsRuntimeClock.Now >= nextRelay) { … }
+
+      yield return FcsRuntimeClock.WaitForSeconds(0.1f);
+  }
+  ```
+
+  放到循环体开头会让一次重调(其中 `SetRotation` 与台解可能耗数秒且自带 yield)抢在本迭代的
+  击发检测/超时检测之前执行,改变「玩家刚扣扳机那一刻」的判定时序。
 - 重调块内:跟踪任务先 `UpdateEntityMotion`;刷新模型(默认 prep 45s)+ `RefreshSolution`。
-- **方位**:差 > 0.1° → 打日志 + 重转;`if (Turret.LastRotationSucceeded) appliedAzimuth = task.angel;`
+- **方位**:门限判据**必须环绕安全**——
+  `if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)`
+  ——按 `Mathf.Abs(a - b)` 实现会在方位跨 0°/360°(如 `appliedAzimuth = 359.9`、
+  `task.angel = 0.2`)时**每 3 秒触发一次假重调**、刷 `[FCS Track] … manual-wait azimuth re-lay`
+  日志并反复占用炮塔。成立 → 先打日志,再重转,**实参逐字**:
+
+  ```csharp
+  yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+      plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+  ```
+
+  随后 `if (Turret.LastRotationSucceeded) appliedAzimuth = task.angel;`
   失败则保持旧值(下个 3s 周期会再试)。
 - **仰角**:距离差 > 0.03 km → `ResolveElevation`(**锁优先级 10**,让路给新任务规划);
   `Ok` 后**先更新 `appliedDistance = task.distance`**(即使随后因仰角差 ≤ 0.05° 不摇炮也更新);
-  再在仰角差 > 0.05° 时打日志 + `SetElevation`,且**仅在 `gun.LastElevationSucceeded` 为真时**
-  才更新 `appliedElevation` 与写回 `task.elevation`。
+  再在仰角差 > 0.05° 时打日志 + `SetElevation`,**实参逐字**为
+  `gun.SetElevation(relaySolve.Elevation, ElevationTimeoutSeconds)`,其中
+  `gun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun`;且**仅在
+  `gun.LastElevationSucceeded` 为真时**才更新 `appliedElevation` 与写回 `task.elevation`。
+- 上面两处实参与 §8.4 的 pre-fire 完全相同,**不得**自选超时(如 15s / 无超时)或省略取消谓词
+  ——否则 F9/换人期间重调协程会卡满整个超时窗。
 - **任一动作失败均不判定计划失败。** 玩家决定何时击发,炮必须一直跟到扳机落下。
 
 ### 8.6 Acquire 换带优先级重载
@@ -597,10 +865,24 @@ plan.Failed = true;
 `loadRetryCount` 是**两条恢复路径共用的同一个计数器**(commit 不符也会 +1,并影响供药机
 路径的 `< 2` 判定)。
 
+**三条恢复路径的精确时序(日志与 `EnqueueTask` 的先后可观测,不得凭下文措辞自行推断)**
+——三条路径**都是先打本分支警告、最后才把原任务入队**(`_fcs.Dispatcher.EnqueueTask(task)`
+是 if/else 之外的**公共尾语句**),因此 `[FCS Plan] …` 警告**恒排在**
+`[FCS Dispatch] queued #{原 serial}` 之前:
+
+| 分支 | 逐步顺序 |
+|---|---|
+| (a) commit 不符 / 射程够 | `DetachForRequeue` → 警告 `committed C{m} still reaches {d:F2}km — requeued…` → `EnqueueTask(task)` |
+| (b) commit 不符 / 射程不够 | `DetachForRequeue` → `RefreshSolution(dump)` → `EnqueueTask(dump)` → 警告 `chamber committed C{m}…` → `EnqueueTask(task)` |
+| (c) 供药机瞬断 | `loadRetryCount++` → `DetachForRequeue` → 警告 `transient dispenser failure, retry {n}/2 — requeued` → `EnqueueTask(task)` |
+
+注意 (b) 中**倾泻弹先入队(拿到 serial)再打警告**——警告串里含 `#{dump}`,必须已编号。
+
 - **commit 不符**(正则 `powder commit mismatch: expected C(\d+), physical C(\d+)`,
   取 physical ≥ 1):`loadRetryCount ≥ 3` → 放弃(真失败);否则 +1,`DetachForRequeue`:
-  - 射程够(`task.distance ≤ physical × 5 + 0.01`):任务直接重入队,下轮以实际装药重解
-    开火。警告日志 `committed C{m} still reaches {d:F2}km — requeued to fire on the actual charge`。
+  - 射程够(`task.distance ≤ physical × 5 + 0.01`):**先**打警告日志
+    `committed C{m} still reaches {d:F2}km — requeued to fire on the actual charge`,
+    **再**把任务重入队,下轮以实际装药重解开火(顺序见上表 (a))。
   - 射程不够:**清膛倾泻弹**——新任务 `{ bulletType = 原弹种, priority = min(100, 原+5),
     hasAimPoint = true, aimLocal = ShortenedAim(原任务, physical × 5 × 0.9) }`,
     `RefreshSolution` 后入队(拿到 serial),警告日志说明原委(附录 C);原任务随后重入队
@@ -649,6 +931,14 @@ plan.Failed = true;
 度量)。队列顺序应最小化总换位时间,同时严格尊重优先级。**
 
 - 每个规划轮、队列 ≥ 2 时运行(诸元刷新之后)。
+- **精确插入点**:`var snapshot = _fcs.Planner.CaptureSnapshot();` **之后**、§16 的资格评估
+  扫描(`foreach (var task in _taskQueue.ToArray())`,其第一步是 `if (TryExpireTask(task)) continue;`)
+  **之前**。两个可观测后果都是规范:
+  1. 本轮的 `planningResults` 顺序、进而 `TaskGunMatcher` 的平局裁决与 admission 顺序
+     **立即**跟随新排序——放到扫描/撮合之后则本轮不跟随,只有下一轮才生效;
+  2. 排序发生在**过期清扫之前**,因此本轮才到期的任务**仍会**参与分带、参与 DP/贪心求解、
+     计入 `totalSeconds`,并**出现在 `[FCS Order] engagement sequence` 日志里**,随后才在扫描中
+     被 `TryExpireTask` 移出队列。
 - **换位耗时函数(方位差必须取最短弧)**:
 
   ```csharp
@@ -665,9 +955,36 @@ plan.Failed = true;
   (不是"紧急带/普通带"、不是按十位分档)。带序是**硬外层顺序**。
 - 带内:任务数 ≤ 10 用 Held-Karp 开路 DP 精确求解,更大退化为最近邻贪心(同度量)。
   带内候选先 `OrderBy(serial)` 保证确定性。
-- 光标:起始方位 = `−snapshot.CurrentAzimuth`(物理角→方位角取反),起始俯仰 =
-  空闲侧炮管实际俯仰(仅一侧空闲用那侧;两侧同态取平均)。逐带滚动:上一带末任务的
-  方位/估计俯仰作为下一带起点。
+- **代价相等时的裁决:三处比较一律用严格 `<`**(`TransitionSeconds` 平局在真实数据下很常见
+  ——两个任务方位/估计仰角相同、同一目标点重复排队、或某一轴恒定使 `Mathf.Max` 落在同一侧):
+  平局一律**保留先遍历到的候选**(经 `OrderBy(serial)` 后即 serial 较小者)。
+
+  | 位置 | 逐字判据 | 初值 |
+  |---|---|---|
+  | DP 松弛 | `if (candidate < dp[nextMask, next]) { dp[…] = candidate; parent[…] = last; }` | — |
+  | DP 终点选择 | `for (j…) if (dp[full - 1, j] < bestSeconds) { bestSeconds = …; bestLast = j; }` | `bestLast = 0`、`bestSeconds = float.PositiveInfinity` |
+  | 贪心最近邻 | `if (c < bestCost) { best = j; bestCost = c; }` | `best = -1`、`bestCost = float.PositiveInfinity` |
+
+  改成 `<=` 会得到**不同的合法最优序列**,而序列本身是可观测的(队列本体被重建、
+  `[FCS Order] engagement sequence` 日志、HUD 队列顺序、matcher 平局裁决)。
+- 光标:起始方位 = `−snapshot.CurrentAzimuth`(物理角→方位角取反);起始俯仰
+  **逐字**为(注意「空闲」在 `TaskDispatcher` 里是被重载的词——同类里
+  `SnapshotTransientFreeSideMask` 的 free side 是
+  `snapshot.LeftSlotAvailable && IsTransient(snapshot.LeftLoading.PhysicalState)`,
+  `CurrentPlannableFreeSideMask` 的又是 `GetPlan(side) == null && IsPlannable(loading.PhysicalState)`;
+  此处取的是**纯 slot 判定**,且读**物理状态的俯仰**):
+
+  ```csharp
+  if (snapshot.LeftSlotAvailable && !snapshot.RightSlotAvailable)
+      return snapshot.LeftPhysical.Elevation;
+  if (snapshot.RightSlotAvailable && !snapshot.LeftSlotAvailable)
+      return snapshot.RightPhysical.Elevation;
+  return (snapshot.LeftPhysical.Elevation + snapshot.RightPhysical.Elevation) * 0.5f;
+  ```
+
+  即「两侧同态」= 两侧 `SlotAvailable` **相同**(都空闲或都不空闲)时取算术平均 `* 0.5f`。
+  选错谓词会改变第一跳的 `TransitionSeconds`,进而改变第一带的最优序列与日志里的 `est lay`。
+  逐带滚动:上一带末任务的方位/估计俯仰作为下一带起点。
 - 排队期仰角未解算,用线性模型估计:装药 = `MaxChargeEnabled ? 6 :
   BallisticCalculator.MinimumCharge(distance)`(≤0 时取 6),`min(d × 12 / 装药, 60)`。
 - **"估计总换位秒数"的定义**:每带的 `pathSeconds` = 「起始光标 → 本带第一个任务」这一跳
@@ -697,6 +1014,16 @@ plan.Failed = true;
   | 队列行 | `  #{serial} P{priority} {弹种} · 打击 {网格} · 距离 {d:F2}km · 方位 {b:F1}°{MotionSuffix(true)}` | `  #{serial} P{priority} {Shell.DisplayName()} · Impact {grid} · Range {d:F2}km · Az {b:F1}°{MotionSuffix(false)}` |
 
   英文串**不得**保留 baseline 的 `T{targetId}`,`P{priority}` 也**不得**只放在一侧。
+- **表中弹种四格(`{弹种}` / `{Shell}` / `{Shell.DisplayName()}`)统一为同一调用**:炮行第 1 行
+  与队列行的弹种**一律是 `{task.bulletType.DisplayName()}`(中英同一调用)**;
+  **不得**用 `bulletType.ToString()` 或直接内插 `{bulletType}`。
+  动因:`BulletTypeExtensions.DisplayName()` 对 `BulletType.PLCM` 返回**字面 `"PCLM"`**,
+  而 `ToString()` 返回 `"PLCM"`(§2/§17.8 记的上游枚举拼写怪癖)——按 `{Shell}` 的字面实现
+  会让 HUD 从 `PCLM` **静默**变成 `PLCM`。
+- **表中进度两格(`{进度}` / `{Progress}`)同样统一**:中英两侧一律是
+  **`{FcsLocalization.ProgressText(task.progress)}`**,该 baseline 映射表**原样保留**。
+  **HUD 不显示 `Progress` 枚举的成员名**——枚举名原样外露的地方只有桥的快照 /
+  `RecentOutcomes`(见 §17.9)。
 
 ## 13. R11 FCS 拥有的炮位瞄点标记(T9/T10)
 
@@ -768,8 +1095,18 @@ plan.Failed = true;
 ### 14.3 `FSC.CancelPendingTask(int serial) → string?` → `TaskDispatcher.CancelPendingBySerial`
 
 - 仅等待队列(执行中交给抢占机制);找到则出队、`progress = Failed`、
-  `failureReason = "cancelled by commander"`,返回 `#{serial} {弹种} brg {b:F1} dist {d:F2}km`;
+  `failureReason = "cancelled by commander"`;
   **没有找到返回 null**(返回类型必须是 `string?`;外部严格区分 null 与非 null,见 §17)。
+- **返回串逐字**(该串是 §17.11 冻结的外部契约,桥拼成 `"cancelled: {返回串}"` 回给 agent):
+
+  ```csharp
+  return $"#{match.serial} {match.bulletType.DisplayName()} brg {match.angel:F1} dist {match.distance:F2}km";
+  ```
+
+  弹种用 **`DisplayName()`**(与 §12 `FirePlan.Label`、§16 日志里的 `{Shell.DisplayName()}`
+  同一套),**不是**直接内插 `{match.bulletType}` 得到的枚举成员名——§17.8 要求
+  `ToString()` 与成员名往返一致,两种渲染在 `DisplayName()` 与成员名不等的弹种上可观测不同。
+  `brg` 后**无单位**,`dist` 后字面 `km`,精度 F1/F2 如上。
 - **【相对旧实现的有意变更】被取消的任务必须调用 `RecordTaskResult`,从而以
   `progress = Failed`、`failureReason = "cancelled by commander"` 进入 `RecentTasks`。**
 
@@ -778,8 +1115,18 @@ plan.Failed = true;
   桥就断定"弹已出膛",记进在途炮弹并给 agent 发 `shell_fired` 事件,再按队列纪律把该目标
   锁死 150s。旧行为(取消**不**进 RecentTasks)会让指挥官每取消一个任务,agent 就收到一条
   **假的"炮弹出膛…等待弹着"**。因此本规格要求取消也走 `RecordTaskResult`。
-- 取消**仍不计入失败统计**(`FailedTaskCount` 不因取消递增);`RecordTaskResult` 只负责把
-  记录推进 `RecentTasks` 环形缓冲。
+- **`RecordTaskResult` 的既有语义保持不变**(§17.15),即它做的是完整四件事:
+  `task.completedAt = FcsRuntimeClock.Now;`、`CompletedTaskCount++;`、
+  `if (progress == Finished) SuccessfulTaskCount++; else if (progress == Failed) FailedTaskCount++;`、
+  `_recentTasks.Enqueue(task)` + 裁剪到 `RecentTaskLimit`、最后
+  `_fcs.SceneInteractor.TaskFinished(task);`。
+- 因此**取消会计入 `CompletedTaskCount` 与 `FailedTaskCount`,并会触发一次
+  `SceneInteractor.TaskFinished`**——这是本项有意变更的**连带后果**,予以接受。
+  (v2 曾同时要求「取消仍不计入失败统计」与「`RecordTaskResult` 保持不变」,二者不可兼得;
+  本版按已声明的有意变更取舍,**删去「取消仍不计入失败统计」一句**,不新增任何只入
+  `RecentTasks`、不动计数器、不通知 SceneInteractor 的旁路记录路径。)
+- 同理,**§10 的过期撤销走的是同一条 `RecordTaskResult`**,故过期同样**计入**
+  `FailedTaskCount` 与 `CompletedTaskCount`(这一条在旧实现里即如此,不是变更)。
 
 ## 15. R14 外部买卡通道(征用台)
 
@@ -831,8 +1178,18 @@ public int     Priority    = 50;
 - **`BuyPowders` 的行为确实变了**:baseline 是 聚焦→摆卡→MoveToSlot→0.5s→**直接点买**;
   复用 `InsertCard` 后在 0.5s 与点买之间**多了一次 `WaitUntilFocused()`**。这是**有意的
   行为变更**,不要为"保持不变"而给 `BuyPowders` 走特例路径。
-- `NormalizeCardId`(§2 规范原文)**唯一一处**——扫描与所有购买路径共用,否则一个名字
-  扫得到买不到。
+- `NormalizeCardId`(§2 规范原文)**全仓只此一份实现**——扫描与所有购买路径共用,否则一个
+  名字扫得到买不到。这里的「扫描」**指名两处**,不要只读成 §15.4 步骤 2 里 `BuyCardById`
+  自己的那次扫描:
+  1. **baseline 中构建 `bulletCards` 字典的弹种卡扫描循环**,其原有的三段 Replace 链
+     `TryParse(id.Replace("SMOKE", "SMK").Replace("PCLM", "PLCM").Replace("Shell", ""), out BulletType type)`
+     必须**原地替换为** `TryParse(NormalizeCardId(id), out BulletType type)`
+     (相邻的 `else if (id == "PowderCharges")` 分支不变);
+  2. §15.4 步骤 2 `BuyCardById` 的扫描与匹配。
+
+  第 1 处带来一个**可观测差异且是规范的**:baseline 那条链**没有 `.Trim()`**,改用
+  `NormalizeCardId` 后,带首尾空白的游戏卡 id 也能被 `Enum.TryParse` 成功解析并进入
+  `bulletCards`——否则该弹种在 `BuyShell` 里永远 `card == null`。
 
 ### 15.4 `BuyCardById`
 
@@ -851,7 +1208,18 @@ public IEnumerator BuyCardById(string cardId, float? bearingDeg, float? distance
 2. **扫描**:遍历 `_requisitionConsole.GetComponentsInChildren<PunchcardRuntime>(true)`
    (**含未激活**);`CurrentDefinition?.ID` 读取包 try/catch;`IsNullOrWhiteSpace` 的 id
    **直接跳过、不进 available**;其余 id 以**原始未归一化形式**按遍历顺序追加进 available
-   (**不去重**)。匹配用原名或规范化名、`OrdinalIgnoreCase`。
+   (**不去重**)。**匹配逐字**为
+
+   ```csharp
+   if (string.Equals(id, cardId, StringComparison.OrdinalIgnoreCase)
+       || string.Equals(NormalizeCardId(id!), cardId, StringComparison.OrdinalIgnoreCase))
+       card = runtime.transform;
+   ```
+
+   ——**归一化只施加于台面卡的 id 一侧;`cardId` 入参绝不归一化、不 Trim**,两次比较都用
+   `StringComparison.OrdinalIgnoreCase`,顺序为**先原名后归一化名**(短路 `||`)。
+   若改成归一化 `cardId`(或两侧都归一化),`cardId = "Shell"`、`cardId = "HEShell "`
+   (带空格)一类输入的结果会与旧实现分岔。
    **命中后不 break**,继续扫完,故同名多卡时**最后一个命中者**成为选中卡;选中的
    Transform 是 `runtime.transform` 本身。
    - 没有命中 → done(`card '{cardId}' not found; available [{string.Join(", ", available)}]`)
@@ -861,13 +1229,42 @@ public IEnumerator BuyCardById(string cardId, float? bearingDeg, float? distance
 4. **有 bearing**:等 `DialOdometerPunchcardBridge` 出现。
    - **查找是场景全局的**:`UnityEngine.Object.FindObjectOfType<DialOdometerPunchcardBridge>()`
      ——**不以征用台为根**(控件是动态生成的,限定到 `_requisitionConsole` 子树会查不到)。
-   - **两套时基**:截止时刻 `var waitUntil = Time.unscaledTime + 4f;`,循环条件
-     `while (bridge == null && Time.unscaledTime < waitUntil)`(非缩放实时);
-     步进等待是 `FcsRuntimeClock.WaitForSeconds(0.25f)`(**任务时钟**,失焦/暂停时不推进)。
-   - 循环**先探测再等待**(桥已存在时零等待),超时判定在探测之后。
+   - **两套时基 + 逐字循环体**:截止时刻用**非缩放实时** `Time.unscaledTime`,步进等待用
+     **任务时钟** `FcsRuntimeClock.WaitForSeconds(0.25f)`(失焦/暂停时不推进):
+
+     ```csharp
+     var waitUntil = Time.unscaledTime + 4f;
+     while (bridge == null && Time.unscaledTime < waitUntil)
+     {
+         bridge = UnityEngine.Object.FindObjectOfType<DialOdometerPunchcardBridge>();
+         if (bridge == null)
+             yield return FcsRuntimeClock.WaitForSeconds(0.25f);
+     }
+     if (bridge == null) { done(…); yield break; }
+     ```
+
+     即**超时条件在每轮探测之前求值**(它是 `while` 条件的一半),**超时报错在循环之后**;
+     桥已存在时零等待。写成「探测 → 判超时 → 等待」的 do-while 会比这多做一次
+     `FindObjectOfType`,并且在**恰好跨越 4s 截止的那一帧**上有/无桥的判定结果不同。
    - 超时 → done(`card accepted but no bearing controls appeared (not a recon card?)`)。
-   - 拨盘写值:`bridge.bearingDial?.SetDialValue(bearingDeg)` 直接写**原始度数**;
-     dial 引用为 null 时**跳过物理拨盘、不报错**,直接进入等待 + 读值校验 + 内部设置器补偿。
+   - **拨盘写值(必须用 Unity 的 `!= null` 语义,不得用 `?.`)**:
+
+     ```csharp
+     if (bridge.bearingDial != null)
+         bridge.bearingDial.SetDialValue(bearing);      // distance 同构
+     ```
+
+     直接写**原始度数/原始 km**;dial 引用为 null 时**跳过物理拨盘、不报错**,直接进入
+     等待 + 读值校验 + 内部设置器补偿。
+     对 `UnityEngine.Object`,`?.` 走的是**真 null**,`!= null` 走的是**重载过的生命周期比较**
+     ——在「已 Destroy 但引用非 null」的 dial 上,`?.` 会调用进已销毁对象抛
+     `MissingReferenceException`,该异常**未被 try/catch 包住**,会终止整条买卡协程、
+     `done` 永不回调、`LastCardRequestResult` 永不更新;`!= null` 才是按规格意图静默跳过。
+     (同一段规格里 `SetFlapDialSymbol` 的 `binder.dial?.SetDialValue(value)` 与
+     `card.GetComponent<DraggableItem>()?.MoveToSlot()` **确实**是 `?.`——两种写法在旧实现里
+     是刻意区分的,不要统一。)
+     另:传入 `SetDialValue` 的实参是 `if (bearingDeg is { } bearing)` /
+     `if (distanceKm is { } distance)` **解包后的 `float`**,不是 `float?` 本身。
    - → 0.3s → 读值校验:
 
      ```csharp
@@ -886,7 +1283,8 @@ public IEnumerator BuyCardById(string cardId, float? bearingDeg, float? distance
        `bridge.Bearing` 覆盖 `applied`,整块再包一层 try/catch(抛异常则 applied 保持先前值/NaN);
      - 日志**无条件打印**(不论是否发生补偿),打印的是**补偿后的** `applied`。
    - 再 0.3s。
-   - **有 distance:同构**(`bridge.distanceDial?.SetDialValue(distanceKm)` 写**原始 km**、
+   - **有 distance:同构**(`if (bridge.distanceDial != null) bridge.distanceDial.SetDialValue(distance);`
+     写**原始 km**、
      读 `bridge.Distance`、补偿 `SetDistanceInternal(distance, true)` + `ForceRefreshAll()` + 重读、
      无条件打日志),但**校验用普通差值** `Mathf.Abs(appliedDistance - distance) > 0.05f`
      (距离不环绕)。
@@ -918,8 +1316,22 @@ public IEnumerator BuyCardById(string cardId, float? bearingDeg, float? distance
        `""` 处理。
      - 没有找到 → 报 `symbol '{s}' not in [{表}]`。
      - 线性映射 `value = min + (max−min) × i / (len−1)`(单字符表取 min),用
-       `MapDialValueToSymbolIndex` 验证,不符则按方向以 `(max−min)/(len×4)` 步长
-       nudge ≤ 5 次;`dial?.SetDialValue(value)`,返回 `ok`。
+       `MapDialValueToSymbolIndex` 验证,不符则 nudge。**nudge 逐字**:
+
+       ```csharp
+       for (var attempt = 0; attempt < 5 && binder.MapDialValueToSymbolIndex(value) != index; attempt++)
+           value += (max - min) / (symbols.Length * 4f)
+                  * (binder.MapDialValueToSymbolIndex(value) < index ? 1f : -1f);
+       binder.dial?.SetDialValue(value);
+       return "ok";
+       ```
+
+       三点是规范:(a) 循环条件与方向**各自独立地重新调用** `MapDialValueToSymbolIndex(value)`
+       (每轮**两次**调用),**方向每轮重算**——按「一次性算定后固定」或按 `value` 与目标值
+       大小比较来实现,落在非单调映射或边界上时最终 `value` 不同,拨盘会停在别的符号上;
+       (b) 最多 5 轮;(c) **无论是否收敛,循环结束后一律** `binder.dial?.SetDialValue(value)`
+       **并 `return "ok"`**——nudge 未收敛**不算错误**,不产生 `symbol '{s}' not in [{表}]`
+       之外的任何失败串。(此处的 `dial?.` 确实是空条件调用,与步骤 4 的 `!= null` 刻意不同。)
    - `[FCS] card start grid '{startGrid}': letter={r1}, number={r2}` 日志在**失败判定之前**
      打印(回显**原始未 Trim** 串),因此成功和失败两种情况都会出现该行;随后失败才
      done(`start grid failed: letter={..}, number={..}`) 并 `yield break`。
@@ -1003,6 +1415,31 @@ public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearin
 改名(如 `_core`/`_instance`)后桥所有调用静默退化成 "FCS instance unavailable"。桥用
 `BindingFlags.NonPublic` 读取,所以**私有可保持私有,但名字是接口**。
 
+**桥对 FSC 实例的缓存不变式(同样是契约,不只是四个名字)**:桥并非每次都重走这条链
+——`ResolveFsc` **只在 `Current` 返回的 FcsModule 对象标识变化、或它自己缓存的 `_fsc` 为 null
+时**才重读 `_fcs`:
+
+```csharp
+if (!ReferenceEquals(module, _lastModule) || _fsc == null)
+{
+    _lastModule = module;
+    _fsc = module.GetType().GetField("_fcs", AnyInstance)?.GetValue(module);
+}
+```
+
+因此必须冻结两条:
+
+- (a) **一个 FcsModule 实例在其生命周期内只能持有唯一一个 FSC 实例**——不得在同一 module
+  实例上因重绑/换场景把 `_fcs` 换成新 FSC(哪怕先置 null 再赋新值,桥也**永远不会**重读,
+  因为它的缓存非 null 且 module 标识未变);
+- (b) **一旦某 module 的 FSC 被 Shutdown/Dispose,`LogicReloader.Current` 必须停止返回该
+  module**(返回 null 或返回新 module),否则桥会一直握着已释放的 FSC。
+
+baseline 的 `FcsModule` 恰好满足(`Initialize` 里 `_fcs = new FSC(...)` 一次、`Shutdown` 里
+置 null),但 `FcsModule` 在 clean-room 重写范围内,把它改成「长寿 module + 每次绑定重建
+FSC」是很自然的设计,而破坏是**完全静默**的:桥的一切读写打在已死 ALC 的旧对象上,
+`ReadStatus` 照样返回 dto、`EnqueueTask` 照样返回 `"ok"`。
+
 ### 17.2 类型全名与程序集位置
 
 - `IronNestFCS.Logic.FSC`
@@ -1023,7 +1460,9 @@ public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearin
 | `LeftTask`、`RightTask` | FSC | **属性** | `GetProperty`,**无字段回退** |
 | `QueueCan`、`RecentTasks` | FSC | **属性** | `GetProperty`,无回退 |
 | `ConsoleCardRequestResult` | FSC | **属性** | `GetProperty`,无回退 |
-| `IsBound`、`PendingCount`、`AutoFireEnabled`、`MaxChargeEnabled` | FSC | **属性** | `GetProperty` |
+| `IsBound` | FSC | **`bool` 属性** | `Get<bool>("IsBound")` |
+| `PendingCount` | FSC | **`int` 属性** | `Get<int>("PendingCount")` |
+| `AutoFireEnabled`、`MaxChargeEnabled` | FSC | **`bool` 属性** | `Get<bool>(…)` |
 | `CompletedTaskCount`、`SuccessfulTaskCount`、`FailedTaskCount` | FSC | **`int` 属性** | `GetProperty` |
 | `SharedResources` | FSC | 属性**或**字段均可 | `GetRequisitionLock` 是唯一有 property-或-field 双路的 |
 | `MapTable` | FSC | **字段** | 桥只用 `GetField` |
@@ -1033,6 +1472,22 @@ public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearin
 把 `QueueCan`/`RecentTasks`/`LeftTask`/`RightTask`/`ConsoleCardRequestResult` 之一做成公开
 字段,`GetProperty` 返回 null、`Get<T>` 直接 `return default` ——队列空、任务 null、卡片结果
 永不上报,**全部静默**。
+
+**值类型与成员种类同样是契约**:桥的取值器做的是**硬转换**
+
+```csharp
+T? Get<T>(string name)
+{
+    var p = t.GetProperty(name, AnyInstance);
+    if (p == null) return default;
+    try { return (T?)p.GetValue(fsc); } catch { return default; }
+}
+```
+
+把 `PendingCount` 做成 `long`/`short`,或把 `IsBound`/`AutoFireEnabled`/`MaxChargeEnabled`
+做成 `bool?`/枚举,都会 `InvalidCastException` → 被 `catch { return default; }` 吞掉 →
+快照恒为 `pending=0`、`Bound=false`、自动开火/最大装药恒为 false,**全部静默**
+(`Bound=false` 还会让 agent 误判 FCS 未绑定)。
 
 `CompletedTaskCount` / `SuccessfulTaskCount` / `FailedTaskCount` 进桥的
 `LastFcsSummary`(`"FCS: pending=… done=… fail=…"`)和 agent 快照,三者显式入表,
@@ -1070,6 +1525,14 @@ BindingFlags = `Public|Instance|Static`,**无参数类型数组**),把 `Acquire`
 (如 `AcquireDefault()`)。契约要求**外部改用 `GetMethod("Acquire", Type.EmptyTypes)`**
 精确取无参重载。`Release` 必须保持 public 实例、无参、返回 void、单一重载。
 
+**无参 `Acquire()` 的签名同样逐项冻结**(§4 的 `Acquire() ≡ Acquire(50)` 只定义了语义,
+没定义可见性与返回类型):必须是 **public 实例方法**、返回 **`IEnumerator`**。桥用
+`GetMethod("Acquire", Type.EmptyTypes)` + **默认 BindingFlags(= `Public|Instance|Static`)**
+取到它,把返回值 `as IEnumerator` 后 `yield return`。把它降级成 internal/private 便利方法,
+或让它返回票据对象 / `CustomYieldInstruction` 之外的类型,后果**比「拿不到锁」更糟**:
+桥的 `acquire == null` 分支**不会**把 `consoleLock` 置 null,于是 `finally` 里仍然调用
+`Release()`——在**从未持锁**的情况下把 FCS 自己协程持有的征用台锁释放掉,两条流程当场对撞。
+
 ### 17.6 `EnqueueTask` 的时序契约
 
 `EnqueueTask(ArtilleryTask)` 是**同步方法**(不是协程、不返回 `IEnumerator`,桥丢弃返回值),
@@ -1105,6 +1568,25 @@ BindingFlags = `Public|Instance|Static`,**无参数类型数组**),把 `Acquire`
 | `bulletType` | `BulletType` 枚举 | 见 §17.8 |
 | `progress` | 枚举,成员名冻结 | 见 §17.9 |
 
+**外部入队的任务不带地图标记(`targetId == 0` 是合法值)**:桥唯一在用的入队路径
+`EnqueueAimPoint` 恒置 `targetId = 0` + `hasAimPoint = true` + `aimLocal`。§3 把 `targetId`
+描述为「可回收的地图标记 id」,反而暗示它总该指向某个真实标记——**不是**。契约:
+`targetId == 0` 表示「无标记、纯瞄点任务」;**`EnqueueTask` 的准入、规划轮刷新链、HUD/日志
+与 §13 的 T9/T10 逻辑都不得把 `targetId` 当作必须可解析的标记 id**——不得据此拒绝入队、
+不得回头调 `GetMarkTarget(task.targetId)` 重解。破坏方式极隐蔽:`EnqueueTask` 返回 void,
+桥 Invoke 后**无条件**返回 `"ok"` 并回读 serial(未赋值即 0/-1),一个「标记必须存在」的准入
+守卫会让 agent 的**每一发炮弹凭空消失且无任何回执异常**。(§12 已规定槽位标签 `T9`/`T10`
+是纯位置常量、不依赖 `hasAimPoint` 与真实标记,与此一致。)
+
+**外部写入的 `Vector3` 字段 z 恒为 0**:桥写 `aimLocal = new Vector3(localX, localY, 0f)`,
+运动模型两个向量(`motionOriginLocal`/`motionVelLocalPerSec`)同样恒 z=0,`position` 走 km 帧
+且 z=0。契约:**FCS 不得依赖一个有意义的 z**——不得用它定位地图平面、不得据此判定瞄点非法。
+这一点在别处承重:§14.2 的「已装装药射程」拒绝门刻意用**含 z 的三维模长**,其理由行写着
+「炮塔棋子的 `localPosition.z` 一般与 `task.aimLocal.z` 不等」——该理由对**标记生成**的任务
+成立,但对**桥注入**的任务 z 恒为 0,该门的实际余量与标记任务系统性不同;§7.3/§7.5 的
+`aim.z = task.aimLocal.z` 也只是在原样搬运 0。**§14.2 三维口径对 z=0 任务的既有行为是被接受
+的忠实行为**,不得为此改口径(§3 `MotionSuffix` 的速度同样保持 `Vector3` 口径,见 §3)。
+
 **构造**:必须保留**公开无参构造函数**——桥用 `Activator.CreateInstance(taskType)` 凭空造任务
 (`EnqueueByBearing` 与 `EnqueueAimPoint` 两条主路径)。改成"只能经工厂/带参构造"会让
 `Activator` 抛 `MissingMethodException`,fire 工具整条挂掉。新建实例后未显式设置的字段必须是
@@ -1129,7 +1611,12 @@ BindingFlags = `Public|Instance|Static`,**无参数类型数组**),把 `Acquire`
 - 因此成员名 **`Failed`** 恒为不变式英文:**不能本地化、不能改成 `Aborted`/`Cancelled`、
   不能换成 int 状态码或字符串常量**。比错了不会报错,只会把每一次任务失败都当成一发已出膛
   的炮弹报给 agent。
-- 其余成员名(**`Finished`** 等)会原样出现在快照/HUD 文本里,同样视为对外文本并冻结。
+- **成员名原样外露的地方只有桥侧**:`progress` 枚举成员名(**`Finished`** 等)原样出现在
+  **桥的快照 / `RecentOutcomes`** 里,§17.9 的冻结理由仅此(上一条 `"Failed"` 的逐字比较
+  也在这里),这些成员名同样视为对外文本并冻结。
+- **HUD 不显示枚举名**——§12 炮行第 1 行的 `{进度}` / `{Progress}` 中英两侧一律是
+  `{FcsLocalization.ProgressText(task.progress)}`,该 baseline 映射表原样保留。
+  (v2 曾把「原样出现在快照/HUD 文本里」并列,对 HUD 是错述,本版更正。)
 - `failureReason` 必须是 `string` 且**非 null**(桥 `as string ?? ""` 兜底,但 `DescribeTask`
   里 `Equals(reason, "")` 的判空只认空串)。
 
@@ -1178,6 +1665,8 @@ BindingFlags = `Public|Instance|Static`,**无参数类型数组**),把 `Acquire`
 
 ### 17.14 取消任务的可观测性(**相对旧实现的有意变更**)
 
+(**活跃集合的精确语义与「无空窗」不变式见 §17.16**——本节的裁决以它为前提。)
+
 桥判定"炮弹是否出膛"的唯一依据是 `RecentTasks`:一个 serial 从活跃集合
 (`SerialToMarker` 覆盖的 `LeftTask`/`RightTask`/`QueueCan`)里消失后,若 `RecentOutcomes`
 里查不到以 `"Failed"` 开头的记录,桥就断定"弹已出膛",记进在途炮弹并给 agent 发
@@ -1187,22 +1676,66 @@ agent 就收到一条**假的"炮弹出膛…等待弹着"**,并按队列纪律�
 
 **裁决:FCS 侧修正。** `CancelPendingBySerial` **必须调用 `RecordTaskResult`**,使取消的
 任务以 `progress = Failed`、`failureReason = "cancelled by commander"` 进入 `RecentTasks`
-(见 §14.3)。这是本规格相对旧实现的第 2 项有意变更;取消仍不计入 `FailedTaskCount`。
+(见 §14.3)。这是本规格相对旧实现的第 2 项有意变更。
+
+**连带后果(v3 更正)**:`RecordTaskResult` 按 §17.15 保持不变,它本身会自增
+`CompletedTaskCount`、在 `progress == Failed` 时自增 `FailedTaskCount`、写 `completedAt`、
+入 `_recentTasks` 并裁剪到 `RecentTaskLimit`、最后调用 `SceneInteractor.TaskFinished(task)`。
+因此**取消会计入 `CompletedTaskCount` 与 `FailedTaskCount`,并会触发一次
+`SceneInteractor.TaskFinished`**。v2 曾写「取消仍不计入 `FailedTaskCount`」,那与
+「`RecordTaskResult` 保持不变」不可兼得;本版按有意变更取舍,**该句作废**。
+`FailedTaskCount` 是 §17.3 冻结的外部契约(进桥的 `LastFcsSummary`
+`"FCS: pending=… done=… fail=…"`),实现者不得为规避该计数而绕开 `RecordTaskResult`
+或新增旁路记录路径。§10 的过期撤销走同一条 `RecordTaskResult`,故过期同样计入两个计数器。
 
 ### 17.15 baseline 既有公开面
 
 `IsBound`、`PendingCount`、`FirePriorityStatusText`、`AutoFireEnabled`、`MaxChargeEnabled`、
 `Dispatcher.QueueSnapshot`、`RecordTaskResult` 等保持不变(种类要求见 §17.3)。
 
+### 17.16 活跃集合的语义与「无空窗」不变式(§17.10 / §17.14 的共同前提)
+
+§17.14 的整条裁决建立在一个 §17 此前从未定义的概念上:**活跃集合**。桥每 2 秒轮询一次,把
+`LeftTask` / `RightTask` / `QueueCan` 的**并集**当作「任务还活着」的**唯一**证据
+(`SerialToMarker`);某 serial 从并集消失且 `RecentOutcomes` 里无 `Failed` 记录 → 立刻判定
+炮弹出膛、发 `shell_fired`、把该目标锁死 150s,并把条目从 `_deployedTasks` **永久删除**
+(此后真正的出膛/失败**再也不会**被报告):
+
+```csharp
+foreach (var serial in _deployedTasks.Keys.Where(s => !live.ContainsKey(s)).ToList())
+{ … _inFlight.Add(dep with { FiredAt = … }); EventLog.Append("shell_fired", …) }
+```
+
+因此冻结三条:
+
+1. **`LeftTask` / `RightTask` 的语义** = 「当前占用该炮位的计划的 `Task`」(baseline
+   `_leftPlan?.Task`),**从占位到释放期间恒非 null**。
+2. **任务离开 `QueueCan` 与出现在 `LeftTask`/`RightTask` 之间不得跨帧(不得隔着任何 yield)**。
+   baseline 靠**调用顺序**保证:先 `PlanExecutor.AddPlan(plan)`(占位)、**成功后才**
+   `RemovePendingTask(task)`。把顺序倒过来、或把占位挪进 `PrepareLocal` 协程里等锁之后,
+   就会开出一个多帧的「三处皆无」窗口,桥**必然**误报幽灵出膛。抢占退回(§5.5)/
+   `DetachForRequeue`(§9)退回队列的**反向切换同理必须同帧完成**。
+3. **任何使任务离开活跃集合的失败路径,`RecordTaskResult` 必须与「离开」发生在同一帧**
+   (§10 过期、§9 `FailPlan` 均如此),否则桥可能在两者之间轮询到「消失且无 `Failed` 记录」。
+
+(与 §17.10 的 `RecentTaskLimit = 20` 保有量要求同源:失败记录必须在被读到之前不被挤掉。)
+
 ## 18. 全局不变量
 
 1. 每个 `yield return` 后重查存活性;取消/换人一律 `yield break`,不得误报失败。
-   **两条例外(不是疏漏,是规范)**:
+   **三条例外(不是疏漏,是规范)**:
    - **准备阶段例外**:尚未取得共享方位所有权的准备阶段(装填、§8.3 pre-aim)**不得**把
      `_current == plan` 纳入存活性——否则同批搭档的计划会在装填后立刻 `yield break`。
      逐阶段谓词见 §8.0。
    - **`GunTargetMarkerLoop` 例外**(§13):该循环是无条件 `while(true)`,循环体内不做
      存活性/绑定检查、不会自行 `yield break`,生命周期完全交给 `TrackCoroutine`。
+   - **`ResolveElevation` 台解例外**(§8.1):`ResolveElevation` 及其物理弹道台回退在其
+     **7 处 `yield return`**(`Ballistic.Acquire`、`WaitUntilFocused`、`SetDistance`/
+     `SetDirection`/`SetCharge`/`SetShellType`、`Calculate`)之后**完全不做任何存活性检查**
+     ——一旦进入必须**跑完**,锁在 `try/finally` 释放;存活性一律交由调用方在
+     `yield return ResolveElevation(...)` 返回之后按 §8.0 的分阶段谓词检查。在台解协程内
+     插存活检查并提前 `yield break`,会提前释放弹道台、留下半写的台面参数,且让
+     `result.Ok` 保持 false,调用方无法区分「失活」与「台解失败」。
 2. 所有锁 try/finally;可取消 Acquire 在占锁前最后一刻仍要查取消。
 3. 反射契约面(§17)与日志格式(附录 C)是接口,不是实现细节。
 4. HUD/玩家可见文本走 `FcsLocalization.T(中, 英)` 双语,**两侧必须完全对称**(§12);
@@ -1210,6 +1743,11 @@ agent 就收到一条**假的"炮弹出膛…等待弹着"**,并按队列纪律�
 5. 禁止 Update/协程里每帧 FindObjectsOfType;昂贵查找必须缓存(如世界时钟、炮塔棋子)。
    例外:§15.4 的 `DialOdometerPunchcardBridge` / `DialToSplitFlipDisplayBinder` 是买卡流程
    内的一次性查找,允许全局 Find。
+   **世界时钟例外(§7.1)**:`MissionNow` 在**缓存仍为 null 时每次求值都重扫**
+   `FindObjectsOfType<GenericTimerSceneSync>()`,扫到后才不再扫;**不得**为「满足本条」而加
+   「已扫描过」标志——那会让晚生成的世界时钟永远不被拾取,`MissionNow` 永久退到另一个时间
+   基准。同理 §6.1 的炮塔棋子是**每次调用惰性重试 Find**(仅在缓存为 null 时),也不是
+   「只查一次」。
 6. 空引用防御:Il2Cpp 对象属性访问包 try/catch;场景重载后指针可能失效。异常时的兜底取值
    本身是规范(如 §7.2 的 `visible = false, alive = true`)。
 7. **源文件编码**:含非 ASCII 字面量的 `.cs` 一律 UTF-8 with BOM(§0)。
@@ -1231,6 +1769,7 @@ agent 就收到一条**假的"炮弹出膛…等待弹着"**,并按队列纪律�
 | 紧急阈值 | priority ≥ 90(`UrgentPriorityThreshold`) |
 | 跟踪常量 | 重调间隔 3s;ε:方位 0.1°、距离 0.03km、仰角 0.05°;pre-fire 显著误差 0.05km(`aimAdjusted` 时 0.03km);prep:排队/pre-aim 45s、pre-fire 15s;提前量上限 3km(局部 `3f/3.8164f`);失联 90s;采样窗 0.5–10s(**dt < 0.5 时 vel 与样本均不动**);速度低通 0.5 |
 | 距离口径 | §7 `ApplyMotionModel`/`ShortenedAim` = **水平**(`Vector2`);§14 `AdjustAim` = **三维完整模长**(`Vector3`,含 z)——刻意不同 |
+| 速度口径 | §3 `MotionSuffix` 的 km/h = `motionVelLocalPerSec.magnitude`(**`Vector3`,含 z**)× 3.8164 × 3600;航向只用 x/y(`Atan2(vel.x, vel.y)`) |
 | 恢复上限 | commit 不符 ≤3 次;供药机 ≤2 次(两者**共用** `loadRetryCount`);倾泻弹射程系数 0.9;倾泻弹优先级 +5(≤100) |
 | 序列规划 | 精确 DP 上限 10 任务/带;带 = priority 值完全相同的任务集合;标记循环 0.5s(等待在前);过期扫描 1s |
 | 买卡时基 | 等桥截止 `Time.unscaledTime + 4f`;步进 `FcsRuntimeClock.WaitForSeconds(0.25f)`;拨盘后 0.3s;起始网格后 0.4s;`InsertCard` 0.5s;`PressBuy` 2s |
@@ -1252,9 +1791,15 @@ agent 就收到一条**假的"炮弹出膛…等待弹着"**,并按队列纪律�
 
 > 编码纪律:表中所有 `°` 均为 **U+00B0**;旧实现输出的 `掳` 是丢 BOM 后按 GBK 重解码的
 > 事故产物,**不要复现**(§0)。部分行按旧实现用 ASCII 字面 `deg` 而非 `°`,已逐行照录。
+>
+> **日志级别也是可观测契约**(MelonLoader 控制台以前缀与颜色区分):正文里逐字给出
+> `MelonLogger.Msg` / `MelonLogger.Warning` 的以正文为准;本表内凡未在正文指定级别者,
+> 已在该行后补注级别。**同前缀不代表同级别**——`[FCS Dispatch]` 下过期行是 `Warning`,
+> 取消行是 `Msg`。
 
 - `[FCS] firing origin bound to 'Player Turret Piece' local=({x:F3},{y:F3})`
-  (对象名由 `MapTable.PlayerTurretPieceName` 插值;仅 Find 成功那一次打印)
+  (对象名由 `MapTable.PlayerTurretPieceName` 插值;**每次惰性 Find 成功都打印一次**——
+  Find 失败不打印,且**不得**用「已打印过」标志抑制场景重载后重绑定时的再次打印,详见 §6.1)
 - `[FCS] #{serial} solution refreshed: {b0:F1}°/{d0:F2}km -> {b1:F1}°/{d1:F2}km`
 - `[FCS Track] {Label}: pre-aim elevation refresh {旧:F2}° -> {新:F2}° (analytic|console)`
 - `[FCS Track] {Label}: pre-fire azimuth correction {旧:F2}° -> {新:F2}° (cross error {m:F0}m)`
@@ -1270,12 +1815,16 @@ agent 就收到一条**假的"炮弹出膛…等待弹着"**,并按队列纪律�
   `string.Join(" -> ", ordered.Select(t => $"#{t.serial}(P{t.priority} {t.angel:F0}deg)"))`
   ——**`#` 后是任务 serial,不是序位**;角度是任务 `angel`(方位角),F0,后缀字面 `deg`;
   分隔符字面 `" -> "`。示例:`[FCS Order] engagement sequence (est lay 38s): #12(P90 123deg) -> #9(P50 271deg)`
+  ——级别 **`MelonLogger.Msg`**
 - `[FCS Plan] {victim.Label} preempted by urgent #{serial} P{p} (load {shell} C{c} transfers; min required C{m})`
 - `[FCS Dispatch] queued #{serial} P{priority}; pending={n}`
 - `[FCS Dispatch] urgent #{serial}: {preemptDetail}`(**仅抢占成功时打印**——§5.5)
 - `[FCS Dispatch] #{serial} expired after {validForSeconds:F0}s in queue; auto-cancelled`
   (`{n}` 取 **validForSeconds**,不是实测经过时间——§10)
 - `[FCS Dispatch] pending #{serial} cancelled by commander; pending={n}`
+  ——级别 **`MelonLogger.Msg`**。注意它与紧邻的过期行同为 `[FCS Dispatch]` 前缀,但过期行是
+  `MelonLogger.Warning`、本行是 `Msg`,**不要**据前缀推成 Warning(级别在 MelonLoader
+  控制台里以前缀与颜色可观测)。
 - `[FCS Plan] {Label}: committed C{m} still reaches {d:F2}km — requeued to fire on the actual charge`
 - `[FCS Plan] {Label}: chamber committed C{m}, target {d:F2}km out of its reach — queued chamber-clearing shot #{dump} at {r:F1}km same bearing; original requeued for fresh load`
 - `[FCS Plan] {Label}: transient dispenser failure, retry {loadRetryCount}/2 — requeued`
