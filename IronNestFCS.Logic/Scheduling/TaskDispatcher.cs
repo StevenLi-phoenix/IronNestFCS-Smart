@@ -32,6 +32,10 @@ internal sealed class TaskDispatcher
     private bool _physicalRetryWaiting;
     private int _physicalRetryMask;
 
+    // Unique task serial source (#1, #2, …). A task keeps its serial across re-enqueues
+    // (preemption returns); the counter restarts with the dispatcher (F9 / scene reload).
+    private int _serialCounter;
+
     public int PendingCount => _taskQueue.Count;
 
     // FirePlanExecutor uses this to decide whether a lone plan should wait for a possible partner.
@@ -62,6 +66,8 @@ internal sealed class TaskDispatcher
 
     public void EnqueueTask(ArtilleryTask task)
     {
+        if (task.serial == 0)
+            task.serial = ++_serialCounter;
         task.progress = Progress.Pending;
         task.pendingHint = PendingHint.None;
         task.startedAt = FcsRuntimeClock.Now;
@@ -73,7 +79,7 @@ internal sealed class TaskDispatcher
 
         // Intent-only queue: no gun/loading read here.
         _taskQueue.Enqueue(task);
-        MelonLogger.Msg($"[FCS Dispatch] queued T{task.targetId} P{task.priority}; pending={_taskQueue.Count}");
+        MelonLogger.Msg($"[FCS Dispatch] queued #{task.serial} T{task.targetId} P{task.priority}; pending={_taskQueue.Count}");
 
         // Urgent task with both guns busy: try to hijack a matching-load gun before dispatching.
         // The preempted task re-enters this queue via EnqueueTask (its priority < urgent, so no recursion).
@@ -466,33 +472,19 @@ internal sealed class TaskDispatcher
     }
 
     /// <summary>
-    /// Commander-initiated cancellation of a PENDING task (not yet on a gun) by target id.
-    /// Removes the first queue match and returns its description; executing plans are
-    /// untouched (preemption handles those). Not counted as a failure.
+    /// Commander-initiated cancellation of a PENDING task by its unique serial (#N) — the
+    /// unambiguous handle (targetId is the recycled marker id and repeats). Executing plans
+    /// are untouched (preemption handles those). Not counted as a failure.
     /// </summary>
-    public string? CancelPendingByTargetId(int targetId)
+    public string? CancelPendingBySerial(int serial)
     {
-        var items = _taskQueue.ToArray();
-        _taskQueue.Clear();
-
-        ArtilleryTask? cancelled = null;
-        foreach (var task in items)
-        {
-            if (cancelled == null && task.targetId == targetId)
-            {
-                cancelled = task;
-                continue;
-            }
-            _taskQueue.Enqueue(task);
-        }
-
-        if (cancelled == null)
+        var match = _taskQueue.FirstOrDefault(t => t.serial == serial);
+        if (match == null || !RemovePendingTask(match))
             return null;
-
-        cancelled.progress = Progress.Failed;
-        cancelled.failureReason = "cancelled by commander";
-        MelonLogger.Msg($"[FCS Dispatch] pending T{targetId} cancelled by commander; pending={_taskQueue.Count}");
-        return $"T{cancelled.targetId} {cancelled.bulletType.DisplayName()} brg {cancelled.angel:F1} dist {cancelled.distance:F2}km";
+        match.progress = Progress.Failed;
+        match.failureReason = "cancelled by commander";
+        MelonLogger.Msg($"[FCS Dispatch] pending #{serial} T{match.targetId} cancelled by commander; pending={_taskQueue.Count}");
+        return $"#{match.serial} {match.bulletType.DisplayName()} brg {match.angel:F1} dist {match.distance:F2}km";
     }
 
     private bool RemovePendingTask(ArtilleryTask target)

@@ -95,8 +95,8 @@ internal sealed class FirePriorityCoordinator
         b.Compared = true;
         UpdateDetails(a, b);
         _statusText = FcsLocalization.T(
-            $"射击顺序：T{first.Task.targetId} → T{second.Task.targetId}（一次性比对）",
-            $"Firing order: T{first.Task.targetId} → T{second.Task.targetId} (compared once)");
+            $"射击顺序：#{first.Task.serial} → #{second.Task.serial}（一次性比对）",
+            $"Firing order: #{first.Task.serial} → #{second.Task.serial} (compared once)");
         MelonLogger.Msg($"[FCS Order] batch {executionBatchId} paired once: {first.Label} first, {second.Label} second; {reason}");
         return first;
     }
@@ -115,16 +115,16 @@ internal sealed class FirePriorityCoordinator
         UpdateDetails(plan, null);
         var uiReason = FcsLocalization.UiReason(reason);
         _statusText = FcsLocalization.T(
-            $"射击顺序：T{plan.Task.targetId} 单独执行（{uiReason}）",
-            $"Firing order: T{plan.Task.targetId} single commit ({uiReason})");
+            $"射击顺序：#{plan.Task.serial} 单独执行（{uiReason}）",
+            $"Firing order: #{plan.Task.serial} single commit ({uiReason})");
         MelonLogger.Msg($"[FCS Order] batch {plan.ExecutionBatchId} single committed: {plan.Label}; {FcsLocalization.LogReason(reason)}");
     }
 
     public void PromoteCommitted(FirePlan plan)
     {
         _statusText = FcsLocalization.T(
-            $"射击顺序：T{plan.Task.targetId} 按既定顺序执行",
-            $"Firing order: T{plan.Task.targetId} promoted in committed order");
+            $"射击顺序：#{plan.Task.serial} 按既定顺序执行",
+            $"Firing order: #{plan.Task.serial} promoted in committed order");
         MelonLogger.Msg($"[FCS Order] promoting batch {plan.ExecutionBatchId} plan without re-compare: {plan.Label}");
     }
 
@@ -132,15 +132,15 @@ internal sealed class FirePriorityCoordinator
     {
         UpdateDetails(plan, null);
         _statusText = FcsLocalization.T(
-            $"射击顺序：T{plan.Task.targetId} 未比对，等待另一个 FirePlan",
-            $"Firing order: T{plan.Task.targetId} unpaired, waiting for another FirePlan");
+            $"射击顺序：#{plan.Task.serial} 未比对，等待另一个 FirePlan",
+            $"Firing order: #{plan.Task.serial} unpaired, waiting for another FirePlan");
     }
 
     public void MarkShot(FirePlan plan)
     {
         _statusText = FcsLocalization.T(
-            $"射击状态：T{plan.Task.targetId} 已物理击发，重新读取剩余计划",
-            $"Fire state: T{plan.Task.targetId} physically fired; reconciling remaining plans");
+            $"射击状态：#{plan.Task.serial} 已物理击发，重新读取剩余计划",
+            $"Fire state: #{plan.Task.serial} physically fired; reconciling remaining plans");
     }
 
     private void UpdateDetails(FirePlan? a, FirePlan? b)
@@ -163,12 +163,12 @@ internal sealed class FirePriorityCoordinator
         {
             var eta = Math.Max(0f, plan.EstimatedReadyAt - FcsRuntimeClock.Now);
             return FcsLocalization.T(
-                $"{sideName} T{plan.Task.targetId}: 计划ETA {eta:F1}s，E{plan.Elevation:F1} / Az{plan.Azimuth:F1}",
-                $"{sideName} T{plan.Task.targetId}: planned ETA {eta:F1}s, E{plan.Elevation:F1} / Az{plan.Azimuth:F1}");
+                $"{sideName} #{plan.Task.serial}: 计划ETA {eta:F1}s，E{plan.Elevation:F1} / Az{plan.Azimuth:F1}",
+                $"{sideName} #{plan.Task.serial}: planned ETA {eta:F1}s, E{plan.Elevation:F1} / Az{plan.Azimuth:F1}");
         }
 
         return FcsLocalization.T(
-            $"{sideName} T{plan.Task.targetId}: ETA待测，alignment={plan.AlignmentScore:F1}",
-            $"{sideName} T{plan.Task.targetId}: ETA unavailable, alignment={plan.AlignmentScore:F1}");
+            $"{sideName} #{plan.Task.serial}: ETA待测，alignment={plan.AlignmentScore:F1}",
+            $"{sideName} #{plan.Task.serial}: ETA unavailable, alignment={plan.AlignmentScore:F1}");
     }
 }

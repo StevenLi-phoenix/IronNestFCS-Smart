@@ -297,8 +297,8 @@ public class MapTable {
         task.aimLocal = aim;
         task.aimAdjusted = true;
         RefreshSolution(task);
-        MelonLogger.Msg($"[FCS] T{task.targetId} aim adjusted by agent -> brg {task.angel:F1}deg, {task.distance:F2}km [{task.progress}]");
-        return $"ok: T{task.targetId} 已改瞄 -> 方位{task.angel:F1}°, 距离{task.distance:F2}km (当前阶段{task.progress})";
+        MelonLogger.Msg($"[FCS] #{task.serial} (marker T{task.targetId}) aim adjusted by agent -> brg {task.angel:F1}deg, {task.distance:F2}km [{task.progress}]");
+        return $"ok: #{task.serial} 已改瞄 -> 方位{task.angel:F1}°, 距离{task.distance:F2}km (当前阶段{task.progress})";
     }
 
     public IEnumerator GetStableMarkTarget(int index, Action<ArtilleryTask?> completed,
