@@ -1,4 +1,4 @@
-using HarmonyInstance = HarmonyLib.Harmony;
+﻿using HarmonyInstance = HarmonyLib.Harmony;
 using System.Collections;
 using IronNestFCS.Abstractions;
 using IronNestFCS.Logic.Execution;
@@ -7,6 +7,7 @@ using IronNestFCS.Logic.Infrastructure;
 using IronNestFCS.Logic.Localization;
 using IronNestFCS.Logic.Scheduling;
 using MelonLoader;
+using UnityEngine;
 
 namespace IronNestFCS.Logic;
 
@@ -54,6 +55,9 @@ public class FSC
     public int CompletedTaskCount => Dispatcher.CompletedTaskCount;
     public int SuccessfulTaskCount => Dispatcher.SuccessfulTaskCount;
     public int FailedTaskCount => Dispatcher.FailedTaskCount;
+    // External bridges poll this every couple of seconds and compare it against the previous read to detect a
+    // new purchase result, so it must stay a property and must be "" (never null) before the first request lands.
+    public string ConsoleCardRequestResult => SharedResources.LastCardRequestResult;
     public string FirePriorityStatusText => FirePriority.StatusText;
     public string FirePriorityLeftDetail => FirePriority.LeftDetail;
     public string FirePriorityRightDetail => FirePriority.RightDetail;
@@ -123,6 +127,7 @@ public class FSC
             TrackCoroutine(SharedResources.ResetFireControlsAfterBind());
             TrackCoroutine(TriggerConsole.ReviewStateLoop());
             TrackCoroutine(SharedResources.ReplenishPowderLoop());
+            TrackCoroutine(GunTargetMarkerLoop());
         }
 
         return IsBound;
@@ -145,6 +150,12 @@ public class FSC
             SceneInteractor.RefreshBulletTypeButtons();
         SceneInteractor.Update();
         PlanExecutor.Tick();
+
+        // A time-limited task must expire even while no planning round runs; the dispatcher throttles the
+        // scan internally, so pumping it every focused frame costs nothing. It runs after this frame's
+        // interaction and execution pumps so a task those admit onto a gun is safe from the sweep.
+        Dispatcher.SweepExpiredTasks();
+
         CaptureEstimatedFlightTime(LeftRight.Left);
         CaptureEstimatedFlightTime(LeftRight.Right);
     }
@@ -196,6 +207,109 @@ public class FSC
     }
 
     public void EnqueueTask(ArtilleryTask task) => Dispatcher.EnqueueTask(task);
+
+    /// <summary>
+    /// Re-aims a task that the commander already handed to the FCS. Guns are searched before the pending queue so
+    /// a task that is already being executed is corrected in place instead of matching a stale queue entry.
+    /// Never returns null: the machine-readable contract is that success starts with a lowercase "ok".
+    /// </summary>
+    public string AdjustTaskAim(int serial, float localX, float localY)
+    {
+        var left = LeftTask;
+        if (left != null && left.serial == serial && IsAdjustableOnGun(left))
+            return MapTable.AdjustAim(left, localX, localY, true);
+
+        var right = RightTask;
+        if (right != null && right.serial == serial && IsAdjustableOnGun(right))
+            return MapTable.AdjustAim(right, localX, localY, true);
+
+        foreach (var pending in Dispatcher.QueueSnapshot)
+        {
+            if (pending.serial == serial)
+                return MapTable.AdjustAim(pending, localX, localY, false);
+        }
+
+        return $"no adjustable task #{serial} — 不在等待队列也不在炮位上(已出膛/已完成/已清除)";
+    }
+
+    /// <summary>A shell that already left the barrel (or a finished/failed task) can no longer be re-aimed.</summary>
+    private static bool IsAdjustableOnGun(ArtilleryTask task) =>
+        task.progress != Progress.Finished && task.progress != Progress.Failed;
+
+    /// <summary>
+    /// Cancels a task that is still waiting in the queue. Anything already on a gun is left to the urgent
+    /// preemption path. Returns null when no such pending task exists - external callers distinguish
+    /// null ("no pending task") from a description string ("cancelled"), so this must not report failure as text.
+    /// </summary>
+    public string? CancelPendingTask(int serial) => Dispatcher.CancelPendingBySerial(serial);
+
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, 0f, false, 50, null);
+
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, 0f, false, priority, null);
+
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority, string? startGrid)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, 0f, false, priority, startGrid);
+
+    /// <summary>
+    /// Queues an external buy-card request onto the requisition console. The bool flags carry "value present",
+    /// so a missing bearing/distance must become null: a non-null BearingDeg drags every plain card through the
+    /// recon-dial wait and fails it.
+    /// </summary>
+    public string RequestConsoleCard(
+        string cardId,
+        float bearingDeg,
+        bool hasBearing,
+        float distanceKm,
+        bool hasDistance,
+        int priority,
+        string? startGrid)
+    {
+        SharedResources.EnqueueCardRequest(new ConsoleCardRequest
+        {
+            CardId = cardId,
+            BearingDeg = hasBearing ? bearingDeg : (float?)null,
+            DistanceKm = hasDistance ? distanceKm : (float?)null,
+            // Whitespace-only means "not given": it must not reach the start-grid regex, and it must not
+            // produce a trailing ", start " in the acknowledgement below.
+            StartGrid = string.IsNullOrWhiteSpace(startGrid) ? null : startGrid,
+            Priority = priority,
+        });
+
+        return $"queued to FCS console coordinator (P{priority}"
+               + (hasDistance ? $", dist {distanceKm:F1}km" : "")
+               + (string.IsNullOrWhiteSpace(startGrid) ? "" : $", start {startGrid}") + ")";
+    }
+
+    /// <summary>
+    /// Keeps map markers 9 and 10 on the aim points of the left/right gun. T1-T8 belong to the player and are
+    /// never touched - that discipline lives here, in the only call site, not inside SetGunTargetMarker.
+    /// The loop is deliberately unconditional (invariant 1's named exception in the spec): a transient unbound
+    /// frame must not stop it forever, so its lifetime is owned entirely by TrackCoroutine.
+    /// </summary>
+    private IEnumerator GunTargetMarkerLoop()
+    {
+        while (true)
+        {
+            yield return FcsRuntimeClock.WaitForSeconds(0.5f);
+            MapTable.SetGunTargetMarker(9, ActiveAim(LeftTask));
+            MapTable.SetGunTargetMarker(10, ActiveAim(RightTask));
+        }
+    }
+
+    /// <summary>
+    /// The aim point a gun marker should show, or null to leave the marker where it is. After the shot the
+    /// marker stays on the planned impact point, which is exactly the "where is the shell going" indication.
+    /// </summary>
+    private static Vector3? ActiveAim(ArtilleryTask? task)
+    {
+        if (task == null || !task.hasAimPoint)
+            return null;
+        if (task.progress == Progress.Finished || task.progress == Progress.Failed)
+            return null;
+        return task.aimLocal;
+    }
 
     public IEnumerator ExposeAllEntities() => _sceneExposure.ExposeAllEntities();
 }

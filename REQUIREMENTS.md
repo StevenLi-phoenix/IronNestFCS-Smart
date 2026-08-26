@@ -1839,3 +1839,20 @@ foreach (var serial in _deployedTasks.Keys.Where(s => !live.ContainsKey(s)).ToLi
   ——**两个占位符填的都是 `task.serial`**,输出恒为 `#7 (marker #7)`;该行在
   `RefreshSolution(task)` **之后**打印,`b`/`d` 用刷新后的 `task.angel`/`task.distance`,
   `{progress}` 是 `task.progress` 的枚举 `ToString()`。
+
+## 附录 D 实现归档:已接受偏离(clean-room 实现 vs 旧实现,验证阶段裁定保留)
+
+1. **瞄点固化下沉到 `BuildMarkTarget`**:玩家经 `GetStableMarkTarget` 点出的任务同样获得
+   `hasAimPoint/aimLocal`——旧实现只在无调用方的 `GetMarkTarget` 固化,晚绑定/运动模型/
+   T9T10 对实际玩法路径本处于空转;新行为即 R4/R5/R11 设计意图(§6.2 的正解)。
+2. `TryBind` 复位 `turretMapModel` 缓存(F9 同场景重绑会多打一行绑定日志,诸元不变)。
+3. 可见性扩面:`GetTurretLocalOnMap`/四个 `MapLocal*` 常量 public、`NormalizeCardId`
+   internal(均不在 §17 契约面,无外部消费者)。
+4. `CoroutineLock` 票序号 int(2^31 回绕不可达);票为引用类型,移除语义等价。
+5. `BuyShell` 左右拨盘 switch 无 default(枚举越界时跳过拨盘,现枚举下不可达)。
+6. `CompareExplicitPriority` 循环上界少一个冗余保护(前置 Count 相等判定使其不可达)。
+7. `TryExpireTask` 以 `RemovePendingTask` 结果作幂等门(重复过期不可达,防御性)。
+8. `DisposeState` 顺带复位过期扫描节流点(`_serialCounter` 复位是 §3 要求)。
+9. `PlanEngagementOrder` 两个不可达防御分支 + 顺序变化判定用引用相等(队列元素恒为
+   同批引用,与 serial 值比较等价)。
+10. 过期/焦点门:失焦时 `FcsRuntimeClock.Now` 冻结,sweep 位于焦点早退之后与旧实现一致。

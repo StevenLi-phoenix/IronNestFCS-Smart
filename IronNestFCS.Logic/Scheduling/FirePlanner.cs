@@ -1,4 +1,4 @@
-// Smart fork modifications Copyright (c) 2026 HisenWeb
+﻿// Smart fork modifications Copyright (c) 2026 HisenWeb
 // Based on IronNestFCS by svr2kos2
 // SPDX-License-Identifier: MIT
 
@@ -93,7 +93,7 @@ internal sealed class FirePlanner
         task.pendingHint = PendingHint.None;
 
         MelonLogger.Msg(
-            $"[FCS Match] T{task.targetId}: snapshot currentAz={snapshot.CurrentAzimuth:F2}°, " +
+            $"[FCS Match] #{task.serial}: snapshot currentAz={snapshot.CurrentAzimuth:F2}°, " +
             $"Left={snapshot.LeftLoading.PhysicalState}, Right={snapshot.RightLoading.PhysicalState}");
 
         TaskGunCandidate? left = null;
@@ -222,7 +222,7 @@ internal sealed class FirePlanner
             plan.TrySetEstimatedFlightSeconds(estimatedTti);
 
         MelonLogger.Msg(
-            $"[FCS Plan] T{task.targetId}: committed {plan.Label}, E={plan.Elevation:F2}, Az={plan.Azimuth:F2}, " +
+            $"[FCS Plan] #{task.serial}: committed {plan.Label}, E={plan.Elevation:F2}, Az={plan.Azimuth:F2}, " +
             $"ETA={(plan.EtaKnown ? Math.Max(0f, plan.EstimatedReadyAt - plannedAt).ToString("F1") : "unknown")}s, " +
             $"load={chosen.LoadLabel}");
 
@@ -266,7 +266,7 @@ internal sealed class FirePlanner
             pendingHint = PendingHint.ShellMismatch;
             reason = $"loaded {shell.DisplayName()} does not match requested {task.bulletType.DisplayName()}";
             MelonLogger.Msg(
-                $"[FCS Match] T{task.targetId}: quick reject {side}; " +
+                $"[FCS Match] #{task.serial}: quick reject {side}; " +
                 $"shell={shell.DisplayName()} requested={task.bulletType.DisplayName()}");
             return null;
         }
@@ -283,7 +283,7 @@ internal sealed class FirePlanner
             pendingHint = PendingHint.ChargeRangeInsufficient;
             reason = $"{shell.DisplayName()} C{charge} max range {maxRangeKm:F2}km < target {task.distance:F2}km";
             MelonLogger.Msg(
-                $"[FCS Match] T{task.targetId}: quick reject {side} {shell.DisplayName()} C{charge}; " +
+                $"[FCS Match] #{task.serial}: quick reject {side} {shell.DisplayName()} C{charge}; " +
                 $"target={task.distance:F2}km > max={maxRangeKm:F2}km");
             return null;
         }
@@ -310,7 +310,9 @@ internal sealed class FirePlanner
         int charge,
         BallisticSolveResult result)
     {
-        yield return _fcs.SharedResources.Ballistic.Acquire();
+        // The planning-stage ballistic desk is taken at the task's own priority, so an urgent task never
+        // queues behind a routine one that happens to be solving first.
+        yield return _fcs.SharedResources.Ballistic.Acquire(task.priority);
         try
         {
             yield return FcsRuntimeClock.WaitUntilFocused();

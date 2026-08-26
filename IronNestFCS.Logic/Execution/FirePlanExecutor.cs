@@ -1,8 +1,9 @@
-// Smart fork modifications Copyright (c) 2026 HisenWeb
+﻿// Smart fork modifications Copyright (c) 2026 HisenWeb
 // Based on IronNestFCS by svr2kos2
 // SPDX-License-Identifier: MIT
 
 using System.Collections;
+using System.Text.RegularExpressions;
 using IronNestFCS.Abstractions;
 using IronNestFCS.Logic.FCS;
 using IronNestFCS.Logic.Scheduling;
@@ -24,6 +25,31 @@ internal sealed class FirePlanExecutor
     private const float SameAzimuthToleranceDegrees = 0.09f;
     private const int FireSettlementBufferFrames = 3;
     private const float ReviewLeadTimeBeforeArmSeconds = 1.5f;
+
+    // Execution-stage tracking correction. Loading and a large elevation slew take minutes, so most of the
+    // aim drift on a moving target accumulates here. Corrections are deliberately late and small.
+    private const float TrackRelayIntervalSeconds = 3f;
+    private const float TrackAzimuthEpsilonDegrees = 0.1f;
+    private const float TrackDistanceEpsilonKm = 0.03f;
+    private const float TrackElevationEpsilonDegrees = 0.05f;
+    private const float PreAimPrepSeconds = 45f;
+    private const float PreFirePrepSeconds = 15f;
+
+    // About one third of the HE lethal radius. Below that a correction costs more turret time than it buys.
+    private const float PreFireSignificantErrorKm = 0.05f;
+
+    // A re-lay during a human fire wait must never delay a new task's planning solve, so it takes the
+    // ballistic desk at the lowest priority in use (appendix B).
+    private const int ManualRelayLockPriority = 10;
+
+    // Powder-failure recovery bounds. Both recovery paths share ArtilleryTask.loadRetryCount.
+    private const int PowderCommitRetryLimit = 3;
+    private const int PowderDispenserRetryLimit = 2;
+    private const float ChamberClearingRangeFactor = 0.9f;
+
+    // Produced verbatim by the loading runtime; the two captured groups are the expected and physical charge.
+    private static readonly Regex PowderCommitMismatchPattern =
+        new(@"powder commit mismatch: expected C(\d+), physical C(\d+)");
 
     private readonly FSC _fcs;
     private readonly Dictionary<FirePlan, object> _prepareCoroutines = new();
@@ -97,6 +123,71 @@ internal sealed class FirePlanExecutor
 
     public void Tick() => EvaluateScheduling();
 
+    /// <summary>
+    /// Free a gun for an urgent task by rolling one prepared plan back into the pending queue. Only a plan whose
+    /// physical work can be inherited is eligible: the already committed powder must reach the urgent target and
+    /// the shell must match, because a committed charge can only leave the barrel by being fired.
+    /// </summary>
+    public bool TryPreemptForUrgent(ArtilleryTask urgent, out string detail)
+    {
+        if (HasFreeGun)
+        {
+            detail = "a gun is already free";
+            return false;
+        }
+
+        var requiredCharge = BallisticCalculator.MinimumCharge(urgent.distance);
+        FirePlan? victim = null;
+
+        // Left before right, replacing only on a strictly lower priority, so equal priorities pick the left gun.
+        foreach (var plan in new[] { _leftPlan, _rightPlan })
+        {
+            if (plan == null
+                || plan.Task.priority >= urgent.priority
+                || ReferenceEquals(_current, plan)
+                || ReferenceEquals(_fireWaitOwner, plan)
+                || plan.ShotObserved
+                || plan.Shell != urgent.bulletType
+                || plan.Charge < requiredCharge)
+            {
+                continue;
+            }
+
+            if (victim == null || plan.Task.priority < victim.Task.priority)
+                victim = plan;
+        }
+
+        if (victim == null)
+        {
+            detail = "no preemptable plan (current/armed, higher priority, or shell/charge mismatch)";
+            return false;
+        }
+
+        // Logged before any teardown so this line precedes both the victim's re-queue line and the caller's
+        // urgent line, leaving the console in causal order.
+        MelonLogger.Msg(
+            $"[FCS Plan] {victim.Label} preempted by urgent #{urgent.serial} P{urgent.priority} " +
+            $"(load {victim.Shell.DisplayName()} C{victim.Charge} transfers; min required C{requiredCharge})");
+
+        CancelPreparation(victim);
+        victim.Failed = true;
+        victim.FailureReason = "preempted by urgent task";
+        if (ReferenceEquals(_fireWaitOwner, victim))
+            ClearAllFireWait();
+        ReleaseGunSlot(victim, notify: false);
+
+        // The plan died, the task did not. It keeps its serial and goes back to pending; its elevation will be
+        // re-solved against whatever charge it eventually gets.
+        var task = victim.Task;
+        task.progress = Progress.Pending;
+        task.failureReason = "";
+        task.pendingHint = PendingHint.None;
+        _fcs.Dispatcher.EnqueueTask(task);
+
+        detail = $"preempted {victim.Label}";
+        return true;
+    }
+
     public void OnAutoFireEnabled()
     {
         var plan = _fireWaitOwner;
@@ -113,7 +204,7 @@ internal sealed class FirePlanExecutor
         }
 
         _autoFireIssuedForWait = true;
-        MelonLogger.Msg($"[FCS] AutoFire enabled while T{plan.Task.targetId} is awaiting the shared trigger; firing physical trigger");
+        MelonLogger.Msg($"[FCS] AutoFire enabled while #{plan.Task.serial} is awaiting the shared trigger; firing physical trigger");
         _fcs.TriggerConsole.Fire();
     }
 
@@ -130,10 +221,29 @@ internal sealed class FirePlanExecutor
         if (active.Count == 0)
             return;
 
-        var committed = active.FirstOrDefault(p => p.Compared);
-        if (committed != null)
+        // Cross-batch ordering (R3). The guard above already limits this to the moment no plan owns the shared
+        // azimuth lane: a plan that is already executing is never demoted to _next and never interrupted.
+        var compared = active.Where(p => p.Compared).ToList();
+        if (compared.Count > 0)
         {
-            _next = active.FirstOrDefault(p => !ReferenceEquals(p, committed));
+            var committed = compared.OrderByDescending(p => p.Task.priority).First();
+            var other = active.FirstOrDefault(p => !ReferenceEquals(p, committed));
+
+            // A never-compared plan that outranks the committed one jumps the whole batch order. Two already
+            // compared plans do not take this path: the more urgent one is simply picked as committed above.
+            if (other is { Compared: false } && other.Task.priority > committed.Task.priority)
+            {
+                // CommitSingle logs its own [FCS Order] line first; the override line must follow it.
+                _fcs.FirePriority.CommitSingle(other, "优先级高于已提交计划");
+                MelonLogger.Msg(
+                    $"[FCS Order] priority override: {other.Label} (P{other.Task.priority}) fires before " +
+                    $"committed {committed.Label} (P{committed.Task.priority})");
+                _next = committed;
+                SetCurrent(other, promote: false);
+                return;
+            }
+
+            _next = other;
             SetCurrent(committed, promote: true);
             return;
         }
@@ -205,7 +315,7 @@ internal sealed class FirePlanExecutor
         if (needsPersistentLoad)
         {
             plan.Task.progress = Progress.SelectingBullet;
-            yield return _fcs.SharedResources.Requisition.Acquire();
+            yield return _fcs.SharedResources.Requisition.Acquire(plan.Task.priority);
             try
             {
                 var attempts = 0;
@@ -291,9 +401,39 @@ internal sealed class FirePlanExecutor
             yield return FcsRuntimeClock.WaitForSeconds(0.25f);
         }
 
+        // Phase 1 pre-aim (R6). Loading is done and the large elevation slew has not started, so this is the last
+        // cheap moment to fold the drift accumulated during loading into the angle we are about to command.
+        var aimElevation = plan.Elevation;
+        if (ShouldRefreshTracking(plan.Task))
+        {
+            if (plan.Task.trackEntityId.Length > 0)
+                _fcs.MapTable.UpdateEntityMotion(plan.Task);
+            _fcs.MapTable.ApplyMotionModel(plan.Task, PreAimPrepSeconds);
+            _fcs.MapTable.RefreshSolution(plan.Task);
+
+            var aimSolve = new ElevationSolve();
+            yield return ResolveElevation(plan, aimSolve, plan.Task.priority);
+
+            // Preparation-stage liveness only. _current belongs to whichever plan owns the shared azimuth lane,
+            // which is very likely this plan's batch partner; testing it here would abort every paired plan.
+            if (!IsActive(plan))
+                yield break;
+
+            // The Ok gate is not optional: a failed console solve still reports whatever elevation the display
+            // held, which can be a finite but stale angle. Without Ok we would lay the gun on garbage.
+            if (aimSolve.Ok && Mathf.Abs(aimSolve.Elevation - aimElevation) > TrackElevationEpsilonDegrees)
+            {
+                MelonLogger.Msg(
+                    $"[FCS Track] {plan.Label}: pre-aim elevation refresh {aimElevation:F2}° -> " +
+                    $"{aimSolve.Elevation:F2}° ({(aimSolve.Analytic ? "analytic" : "console")})");
+                aimElevation = aimSolve.Elevation;
+                plan.Task.elevation = aimElevation;
+            }
+        }
+
         // Left/right elevation are independent. Start immediately at physical LoadedReady.
         plan.Task.progress = Progress.Aiming;
-        yield return gun.SetElevation(plan.Elevation, ElevationTimeoutSeconds);
+        yield return gun.SetElevation(aimElevation, ElevationTimeoutSeconds);
 
         // A different gun may have been physically fired while this plan was still preparing. If the physical
         // settlement consumed this plan, do not turn cancellation into a false elevation failure.
@@ -302,7 +442,7 @@ internal sealed class FirePlanExecutor
 
         if (!gun.LastElevationSucceeded)
         {
-            FailPlan(plan, $"elevation did not reach {plan.Elevation:F1}°");
+            FailPlan(plan, $"elevation did not reach {aimElevation:F1}°");
             yield break;
         }
 
@@ -348,6 +488,76 @@ internal sealed class FirePlanExecutor
             yield return null;
         }
 
+        var gun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
+
+        // Correction baselines for phases 2 and 3. They are captured unconditionally and before any refresh:
+        // taken after RefreshSolution the range error would always read zero, and taken inside the trigger gate
+        // phase 3 would have no baseline for a task that only becomes re-aimed during the fire wait.
+        var appliedAzimuth = plan.Azimuth;
+        var appliedElevation = plan.Task.elevation > 0f ? plan.Task.elevation : plan.Elevation;
+        var appliedDistance = plan.Task.distance;
+
+        // Phase 2 pre-fire (R6): coarse laying is done, the trigger protocol has not started. Correct only a
+        // predicted-impact error large enough to matter; a failed correction is never a plan failure here.
+        if (ShouldRefreshTracking(plan.Task))
+        {
+            if (plan.Task.trackEntityId.Length > 0)
+                _fcs.MapTable.UpdateEntityMotion(plan.Task);
+            _fcs.MapTable.ApplyMotionModel(plan.Task, PreFirePrepSeconds);
+            _fcs.MapTable.RefreshSolution(plan.Task);
+
+            // An explicit re-aim is an order, so it is executed at the ordinary tracking epsilon.
+            var significantErrorKm = plan.Task.aimAdjusted ? TrackDistanceEpsilonKm : PreFireSignificantErrorKm;
+
+            var crossErrorKm = Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel))
+                               * Mathf.Deg2Rad * plan.Task.distance;
+            if (crossErrorKm > significantErrorKm)
+            {
+                MelonLogger.Msg(
+                    $"[FCS Track] {plan.Label}: pre-fire azimuth correction {appliedAzimuth:F2}° -> " +
+                    $"{plan.Task.angel:F2}° (cross error {crossErrorKm * 1000f:F0}m)");
+                yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+                    plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+
+                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                    yield break;
+                if (_fcs.Turret.LastRotationSucceeded)
+                    appliedAzimuth = plan.Task.angel;
+            }
+
+            // Captured before appliedDistance moves, because the log below reports the error that triggered
+            // this correction rather than the residual after it.
+            var rangeErrorKm = Mathf.Abs(plan.Task.distance - appliedDistance);
+            if (rangeErrorKm > significantErrorKm)
+            {
+                var preFireSolve = new ElevationSolve();
+                yield return ResolveElevation(plan, preFireSolve, plan.Task.priority);
+
+                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                    yield break;
+
+                if (preFireSolve.Ok)
+                {
+                    appliedDistance = plan.Task.distance;
+                    if (Mathf.Abs(preFireSolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                    {
+                        MelonLogger.Msg(
+                            $"[FCS Track] {plan.Label}: pre-fire elevation correction {appliedElevation:F2}° -> " +
+                            $"{preFireSolve.Elevation:F2}° (range error {rangeErrorKm * 1000f:F0}m)");
+                        yield return gun.SetElevation(preFireSolve.Elevation, ElevationTimeoutSeconds);
+
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (gun.LastElevationSucceeded)
+                        {
+                            appliedElevation = preFireSolve.Elevation;
+                            plan.Task.elevation = appliedElevation;
+                        }
+                    }
+                }
+            }
+        }
+
         var fireWaitToken = 0;
         var autoFireIssued = false;
         PhysicalFireWatch? leftWatch = null;
@@ -355,7 +565,7 @@ internal sealed class FirePlanExecutor
 
         try
         {
-            yield return _fcs.SharedResources.Trigger.Acquire();
+            yield return _fcs.SharedResources.Trigger.Acquire(plan.Task.priority);
             try
             {
                 if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
@@ -440,6 +650,10 @@ internal sealed class FirePlanExecutor
                 : null;
             var resumeGeneration = FcsRuntimeClock.ResumeGeneration;
 
+            // The first manual-wait re-lay happens one interval after the wait opens, not on entry: the gun was
+            // just laid, so an immediate correction would only re-solve what pre-fire already applied.
+            var nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
+
             while (true)
             {
                 yield return FcsRuntimeClock.WaitUntilFocused();
@@ -480,6 +694,67 @@ internal sealed class FirePlanExecutor
                     yield break;
                 }
 
+                // Phase 3 (R6): a manual wait is open-ended, so keep the gun laid on a moving target until the
+                // player actually drops the lever. The block sits at the very end of the loop body: a re-lay can
+                // itself take seconds, and it must not run ahead of this iteration's shot/timeout detection.
+                // No failure here ever fails the plan - the commander decides when to fire.
+                if (!autoFireDeadline.HasValue && ShouldRefreshTracking(plan.Task)
+                                              && FcsRuntimeClock.Now >= nextRelay)
+                {
+                    // Tick from the start of the block so the re-lay's own cost is charged to the interval.
+                    nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
+
+                    if (plan.Task.trackEntityId.Length > 0)
+                        _fcs.MapTable.UpdateEntityMotion(plan.Task);
+                    _fcs.MapTable.ApplyMotionModel(plan.Task);
+                    _fcs.MapTable.RefreshSolution(plan.Task);
+
+                    // DeltaAngle, not a raw difference: an azimuth pair straddling 0° would otherwise fake a
+                    // ~360° error and re-lay the turret every three seconds forever.
+                    if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)
+                    {
+                        MelonLogger.Msg(
+                            $"[FCS Track] {plan.Label}: manual-wait azimuth re-lay {appliedAzimuth:F2}° -> " +
+                            $"{plan.Task.angel:F2}°");
+                        yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+                            plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (_fcs.Turret.LastRotationSucceeded)
+                            appliedAzimuth = plan.Task.angel;
+                    }
+
+                    if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
+                    {
+                        var relaySolve = new ElevationSolve();
+                        yield return ResolveElevation(plan, relaySolve, ManualRelayLockPriority);
+
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+
+                        if (relaySolve.Ok)
+                        {
+                            appliedDistance = plan.Task.distance;
+                            if (Mathf.Abs(relaySolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                            {
+                                MelonLogger.Msg(
+                                    $"[FCS Track] {plan.Label}: manual-wait elevation re-lay " +
+                                    $"{appliedElevation:F2}° -> {relaySolve.Elevation:F2}°");
+                                yield return gun.SetElevation(relaySolve.Elevation, ElevationTimeoutSeconds);
+
+                                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                                    yield break;
+                                if (gun.LastElevationSucceeded)
+                                {
+                                    appliedElevation = relaySolve.Elevation;
+                                    plan.Task.elevation = appliedElevation;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 yield return FcsRuntimeClock.WaitForSeconds(0.1f);
             }
         }
@@ -499,7 +774,7 @@ internal sealed class FirePlanExecutor
 
         // The first check prevents pointless Trigger-lane work. It is not authorization: the live relationship may
         // change while this coroutine waits for the shared physical console lane.
-        yield return _fcs.SharedResources.Trigger.Acquire();
+        yield return _fcs.SharedResources.Trigger.Acquire(follower.Task.priority);
         try
         {
             current = _current;
@@ -538,6 +813,79 @@ internal sealed class FirePlanExecutor
 
         azimuthDelta = Mathf.Abs(Mathf.DeltaAngle(current.Azimuth, follower.Azimuth));
         return azimuthDelta <= SameAzimuthToleranceDegrees;
+    }
+
+    /// <summary>
+    /// Whether this task has anything an execution-stage refresh could change. A tracked entity or a motion model
+    /// moves on its own; an agent re-aim moves a task that is otherwise static, so it opens the same gate.
+    /// </summary>
+    private static bool ShouldRefreshTracking(ArtilleryTask task)
+        => task.trackEntityId.Length > 0 || task.hasMotion || task.aimAdjusted;
+
+    /// <summary>
+    /// Closed-form elevation for the game's linear ballistics: elevation(deg) = distance(km) * 12 / charge,
+    /// capped at 60°. Outside that envelope there is no analytic answer and the physical desk has to decide.
+    /// </summary>
+    public static bool TryAnalyticElevation(int charge, float distanceKm, out float elevationDeg)
+    {
+        elevationDeg = float.NaN;
+        if (charge <= 0 || distanceKm <= 0.01f)
+            return false;
+
+        var candidate = distanceKm * 12f / charge;
+        if (candidate > 60.01f)
+            return false;
+
+        elevationDeg = Mathf.Min(candidate, 60f);
+        return true;
+    }
+
+    /// <summary>
+    /// Single elevation entry point for every execution-stage refresh. Both branches take the same input - the
+    /// plan's committed charge and the task's freshly refreshed range - so the analytic and console answers can
+    /// never disagree about what was asked.
+    ///
+    /// Deliberate exception to the "re-check liveness after every yield" rule: once this coroutine starts it runs
+    /// to completion. Bailing out mid-way would release the ballistic desk with half-written dials and leave
+    /// Ok = false, which the caller could not tell apart from a genuine solve failure. Liveness is the caller's
+    /// job, immediately after this returns.
+    /// </summary>
+    private IEnumerator ResolveElevation(FirePlan plan, ElevationSolve result, int lockPriority)
+    {
+        result.Ok = false;
+        result.Analytic = false;
+        result.Elevation = float.NaN;
+
+        if (TryAnalyticElevation(plan.Charge, plan.Task.distance, out var analytic))
+        {
+            result.Ok = true;
+            result.Analytic = true;
+            result.Elevation = analytic;
+            yield break;
+        }
+
+        yield return _fcs.SharedResources.Ballistic.Acquire(lockPriority);
+        try
+        {
+            yield return FcsRuntimeClock.WaitUntilFocused();
+            yield return _fcs.BallisticCalculator.SetDistance(plan.Task.distance);
+            yield return _fcs.BallisticCalculator.SetDirection(plan.Task.angel);
+            yield return _fcs.BallisticCalculator.SetCharge(plan.Charge);
+            yield return _fcs.BallisticCalculator.SetShellType(plan.Task.bulletType);
+            yield return _fcs.BallisticCalculator.Calculate();
+
+            // The reading is stored even when the solve failed, matching the console's own behaviour; callers
+            // gate on Ok before believing it.
+            var elevation = _fcs.BallisticCalculator.GetElevation();
+            result.Elevation = elevation;
+            result.Ok = _fcs.BallisticCalculator.LastCalculationSucceeded
+                        && !float.IsNaN(elevation)
+                        && !float.IsInfinity(elevation);
+        }
+        finally
+        {
+            _fcs.SharedResources.Ballistic.Release();
+        }
     }
 
     private PhysicalFireWatch BeginFireWatch(GunSystem gun, string sideName)
@@ -615,8 +963,8 @@ internal sealed class FirePlanExecutor
         }
 
         MelonLogger.Msg(
-            $"[FCS Fire] physical settlement complete: Left={(left != null ? $"T{left.Task.targetId}" : "-")}, " +
-            $"Right={(right != null ? $"T{right.Task.targetId}" : "-")}; rebuilding scheduling from reality");
+            $"[FCS Fire] physical settlement complete: Left={(left != null ? $"#{left.Task.serial}" : "-")}, " +
+            $"Right={(right != null ? $"#{right.Task.serial}" : "-")}; rebuilding scheduling from reality");
 
         // Batch first, then trigger planning/scheduling once. FirePlanner will re-read physical/loading state; a
         // just-fired gun therefore remains Pending/recovery-gated even though its FirePlan slot is already free.
@@ -698,6 +1046,11 @@ internal sealed class FirePlanExecutor
         if (plan.CompletionHandled)
             return;
 
+        // Deliberately behind the settlement check above: a plan that already completed must never enter
+        // recovery, or an already fired round would be re-queued as if it were still loadable.
+        if (TryRecoverPowderFailure(plan, reason))
+            return;
+
         plan.Failed = true;
         plan.FailureReason = reason;
         plan.Task.progress = Progress.Failed;
@@ -713,6 +1066,101 @@ internal sealed class FirePlanExecutor
 
         _fcs.Dispatcher.RecordTaskResult(plan.Task);
         ReleaseGunSlot(plan, notify: true);
+    }
+
+    /// <summary>
+    /// R7 powder-failure recovery. A committed charge cannot be topped up or removed - the only way to clear the
+    /// chamber is to fire it - so a mismatch is answered either by shooting the target with the charge we
+    /// actually got, or by throwing that round away on the same bearing and reloading from scratch. A dispenser
+    /// hiccup is just a restock window and is retried a bounded number of times.
+    /// </summary>
+    private bool TryRecoverPowderFailure(FirePlan plan, string reason)
+    {
+        var task = plan.Task;
+
+        var physicalCharge = 0;
+        var mismatch = PowderCommitMismatchPattern.Match(reason);
+        if (mismatch.Success)
+            int.TryParse(mismatch.Groups[2].Value, out physicalCharge);
+
+        if (physicalCharge >= 1)
+        {
+            if (task.loadRetryCount >= PowderCommitRetryLimit)
+                return false;
+
+            task.loadRetryCount++;
+            DetachForRequeue(plan, reason);
+
+            var reachKm = physicalCharge * 5f;
+            if (task.distance <= reachKm + 0.01f)
+            {
+                MelonLogger.Warning(
+                    $"[FCS Plan] {plan.Label}: committed C{physicalCharge} still reaches {task.distance:F2}km — " +
+                    $"requeued to fire on the actual charge");
+            }
+            else
+            {
+                // The round in the chamber can only leave by being fired. Dump it short on the same bearing line
+                // so the gun becomes loadable again; give it a small priority bump so it does not sit behind the
+                // task that is waiting for the very barrel it is blocking.
+                var dumpRangeKm = reachKm * ChamberClearingRangeFactor;
+                var dump = new ArtilleryTask
+                {
+                    bulletType = task.bulletType,
+                    priority = Math.Min(100, task.priority + 5),
+                    hasAimPoint = true,
+                    aimLocal = _fcs.MapTable.ShortenedAim(task, dumpRangeKm),
+                };
+                _fcs.MapTable.RefreshSolution(dump);
+
+                // Queued before the warning so the dump task already carries the serial the warning quotes.
+                _fcs.Dispatcher.EnqueueTask(dump);
+                MelonLogger.Warning(
+                    $"[FCS Plan] {plan.Label}: chamber committed C{physicalCharge}, target {task.distance:F2}km " +
+                    $"out of its reach — queued chamber-clearing shot #{dump.serial} at {dumpRangeKm:F1}km same " +
+                    $"bearing; original requeued for fresh load");
+            }
+        }
+        else if (reason.Contains("powder dispenser") && task.loadRetryCount < PowderDispenserRetryLimit)
+        {
+            task.loadRetryCount++;
+            DetachForRequeue(plan, reason);
+            MelonLogger.Warning(
+                $"[FCS Plan] {plan.Label}: transient dispenser failure, " +
+                $"retry {task.loadRetryCount}/{PowderDispenserRetryLimit} — requeued");
+        }
+        else
+        {
+            return false;
+        }
+
+        _fcs.Dispatcher.EnqueueTask(task);
+        return true;
+    }
+
+    /// <summary>
+    /// Tear a plan down without failing its task, so the task can be planned again. Unlike urgent preemption this
+    /// notifies immediately - the gun is genuinely idle and the requeued task wants the next planning round - and
+    /// it clears the execution pointers explicitly rather than relying on slot release to do it.
+    /// </summary>
+    private void DetachForRequeue(FirePlan plan, string reason)
+    {
+        plan.Failed = true;
+        plan.FailureReason = reason;
+        CancelPreparation(plan);
+
+        if (ReferenceEquals(_fireWaitOwner, plan))
+            ClearAllFireWait();
+        if (ReferenceEquals(_current, plan))
+            _current = null;
+        if (ReferenceEquals(_next, plan))
+            _next = null;
+
+        ReleaseGunSlot(plan, notify: true);
+
+        plan.Task.progress = Progress.Pending;
+        plan.Task.failureReason = "";
+        plan.Task.pendingHint = PendingHint.None;
     }
 
     private void ReleaseGunSlot(FirePlan plan, bool notify)
@@ -748,6 +1196,16 @@ internal sealed class FirePlanExecutor
         return plan.Generation == _fcs.FirePriority.Generation
                && ReferenceEquals(GetPlan(plan.Side), plan)
                && !plan.CompletionHandled;
+    }
+
+    /// <summary>
+    /// One elevation answer. Analytic records which branch produced it, purely for the refresh log.
+    /// </summary>
+    private sealed class ElevationSolve
+    {
+        public bool Ok { get; set; }
+        public float Elevation { get; set; } = float.NaN;
+        public bool Analytic { get; set; }
     }
 
     private sealed class PhysicalFireWatch

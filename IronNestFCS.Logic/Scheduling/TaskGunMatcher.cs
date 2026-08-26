@@ -92,6 +92,13 @@ internal static class TaskGunMatcher
         if (a.Count != b.Count)
             return b.Count.CompareTo(a.Count);
 
+        // Above every cost model: explicit commander priority, evaluated before the LoadedReady exception
+        // below. Placing it after that exception would still let an urgent task lose a gun on the
+        // configurations the exception covers.
+        var explicitPriority = CompareExplicitPriority(a, b);
+        if (explicitPriority != 0)
+            return explicitPriority;
+
         // Narrow single-task exception: when the same task can use either an already-loaded gun or a completely
         // empty gun, consume the compatible LoadedReady round instead of starting a redundant fresh load.
         // This never participates in multi-task set selection, so the existing charge/range protection is intact.
@@ -143,6 +150,29 @@ internal static class TaskGunMatcher
         var bAzimuth = b.Sum(CorrectAzimuthScore);
         if (Math.Abs(aAzimuth - bAzimuth) > FireReadyEstimator.AlignmentTieTolerance)
             return aAzimuth.CompareTo(bAzimuth);
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Lexicographic comparison of both solutions' task priorities in descending order; the more urgent
+    /// solution wins. This is the commander-set ArtilleryTask.priority, not the dispatcher queue rank that
+    /// CompareTaskPriority further down the chain preserves. Ordinary tasks are all P50, so equal vectors
+    /// return 0 and the rest of the original chain decides as before.
+    /// </summary>
+    private static int CompareExplicitPriority(
+        IReadOnlyList<TaskGunAssignment> a,
+        IReadOnlyList<TaskGunAssignment> b)
+    {
+        var aPriorities = a.Select(x => x.Planning.Task.priority).OrderByDescending(x => x).ToArray();
+        var bPriorities = b.Select(x => x.Planning.Task.priority).OrderByDescending(x => x).ToArray();
+
+        for (var i = 0; i < aPriorities.Length; i++)
+        {
+            // Higher priority is the better solution, so the operands are reversed: negative means a wins.
+            if (aPriorities[i] != bPriorities[i])
+                return bPriorities[i].CompareTo(aPriorities[i]);
+        }
 
         return 0;
     }

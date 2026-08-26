@@ -1,4 +1,4 @@
-using IronNestFCS.Logic.FCS;
+﻿using IronNestFCS.Logic.FCS;
 using IronNestFCS.Logic.Localization;
 using MelonLoader;
 using UnityEngine;
@@ -87,13 +87,16 @@ public class FcsWindow
 
         if (queue.Count > 0)
         {
-            Label(FcsLocalization.T($"等待队列：{queue.Count}", $"Pending: {queue.Count}"));
+            // The queue is kept in the order the engagement planner solved for, so say so in the header.
+            Label(FcsLocalization.T(
+                $"等待队列：{queue.Count}（计划炮击顺序）",
+                $"Pending: {queue.Count} (planned engagement order)"));
             foreach (var item in queue)
             {
                 var position = ConvertPosition(item.position);
                 Label(FcsLocalization.T(
-                    $"  T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°",
-                    $"  T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°"));
+                    $"  #{item.serial} P{item.priority} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°{item.MotionSuffix(true)}",
+                    $"  #{item.serial} P{item.priority} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°{item.MotionSuffix(false)}"));
             }
         }
     }
@@ -139,17 +142,20 @@ public class FcsWindow
             return;
         }
 
+        // Pure positional label: marker 9 is always the left gun's aim point, 10 the right one. It does not
+        // depend on whether the map actually carries a 9/10 token, nor on the task having an aim point.
+        var slot = side == "Left" ? "T9" : "T10";
         var elapsed = task.startedAt > 0f ? FcsRuntimeClock.Now - task.startedAt : 0f;
         label(FcsLocalization.T(
-            $"{gunName}：T{task.targetId} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}秒",
-            $"{gunName}: T{task.targetId} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}s"));
+            $"{gunName}：{slot} #{task.serial} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}秒",
+            $"{gunName}: {slot} #{task.serial} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}s"));
 
         var position = ConvertPosition(task.position);
         var flightZh = float.IsNaN(estimatedFlightSeconds) ? "--" : $"{estimatedFlightSeconds:F1}秒";
         var flightEn = float.IsNaN(estimatedFlightSeconds) ? "--" : $"{estimatedFlightSeconds:F1}s";
         label(FcsLocalization.T(
-            $"  打击 {position} · 距离 {task.distance:F2}km · 方位 {task.angel:F1}° · 装药量{task.chargeCount} · 仰角{task.elevation:F1}° · 飞行 {flightZh}",
-            $"  Impact {position} · Range {task.distance:F2}km · Az {task.angel:F1}° · C{task.chargeCount} · E{task.elevation:F1}° · Flight {flightEn}"));
+            $"  打击 {position} · 距离 {task.distance:F2}km · 方位 {task.angel:F1}° · 装药量{task.chargeCount} · 仰角{task.elevation:F1}° · 飞行 {flightZh}{task.MotionSuffix(true)}",
+            $"  Impact {position} · Range {task.distance:F2}km · Az {task.angel:F1}° · C{task.chargeCount} · E{task.elevation:F1}° · Flight {flightEn}{task.MotionSuffix(false)}"));
     }
 
     /// <summary>Converts a map coordinate into the grid/sub-grid notation used by the tactical map.</summary>

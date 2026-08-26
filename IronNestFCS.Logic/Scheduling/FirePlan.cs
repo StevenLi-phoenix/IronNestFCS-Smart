@@ -93,7 +93,9 @@ internal sealed class FirePlan
 
     public GunSide HostSide => Side == LeftRight.Left ? GunSide.Left : GunSide.Right;
     public LoadRequest LoadRequest => new(HostSide, (ShellTypeCode)(int)Shell, Charge);
-    public string Label => $"{Side} T{Task.targetId} {Shell.DisplayName()} C{Charge}";
+    // Tasks are addressed by their globally unique serial. targetId is a recyclable map-marker id and is
+    // never a stable handle, so it must not appear in any label, log or HUD text.
+    public string Label => $"{Side} #{Task.serial} {Shell.DisplayName()} C{Charge}";
 }
 
 internal sealed class FirePlanCandidate
