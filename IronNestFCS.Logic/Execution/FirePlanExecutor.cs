@@ -193,7 +193,7 @@ internal sealed class FirePlanExecutor
         }
 
         _autoFireIssuedForWait = true;
-        MelonLogger.Msg($"[FCS] AutoFire enabled while T{plan.Task.targetId} is awaiting the shared trigger; firing physical trigger");
+        MelonLogger.Msg($"[FCS] AutoFire enabled while #{plan.Task.serial} is awaiting the shared trigger; firing physical trigger");
         _fcs.TriggerConsole.Fire();
     }
 
@@ -840,8 +840,8 @@ internal sealed class FirePlanExecutor
         }
 
         MelonLogger.Msg(
-            $"[FCS Fire] physical settlement complete: Left={(left != null ? $"T{left.Task.targetId}" : "-")}, " +
-            $"Right={(right != null ? $"T{right.Task.targetId}" : "-")}; rebuilding scheduling from reality");
+            $"[FCS Fire] physical settlement complete: Left={(left != null ? $"#{left.Task.serial}" : "-")}, " +
+            $"Right={(right != null ? $"#{right.Task.serial}" : "-")}; rebuilding scheduling from reality");
 
         // Batch first, then trigger planning/scheduling once. FirePlanner will re-read physical/loading state; a
         // just-fired gun therefore remains Pending/recovery-gated even though its FirePlan slot is already free.
@@ -960,7 +960,7 @@ internal sealed class FirePlanExecutor
 
         var task = victim.Task;
         MelonLogger.Msg(
-            $"[FCS Plan] {victim.Label} preempted by urgent T{urgent.targetId} P{urgent.priority} " +
+            $"[FCS Plan] {victim.Label} preempted by urgent #{urgent.serial} P{urgent.priority} " +
             $"(load {victim.Shell.DisplayName()} C{victim.Charge} transfers; min required C{requiredCharge})");
 
         CancelPreparation(victim);

@@ -7,6 +7,7 @@ using IronNestFCS.Logic.Infrastructure;
 using IronNestFCS.Logic.Localization;
 using IronNestFCS.Logic.Scheduling;
 using MelonLoader;
+using UnityEngine;
 
 namespace IronNestFCS.Logic;
 
@@ -123,6 +124,7 @@ public class FSC
             TrackCoroutine(SharedResources.ResetFireControlsAfterBind());
             TrackCoroutine(TriggerConsole.ReviewStateLoop());
             TrackCoroutine(SharedResources.ReplenishPowderLoop());
+            TrackCoroutine(GunTargetMarkerLoop());
             // Card requests are event-driven: EnqueueCardRequest kicks its own drain coroutine.
         }
 
@@ -201,6 +203,26 @@ public class FSC
     // Task handle discipline: the unique serial (#N) is the ONLY external handle for
     // cancel/adjust — targetId is the recycled map-marker id and repeats.
     public string? CancelPendingTask(int serial) => Dispatcher.CancelPendingBySerial(serial);
+
+    /// <summary>
+    /// T1/T2 are FCS-owned gun target markers: T1 tracks the left gun's current aim, T2 the
+    /// right gun's. After the shot they stay put — the resting marker shows the in-flight
+    /// shell's planned impact point until the next task moves it. T3+ stay player-owned.
+    /// </summary>
+    private IEnumerator GunTargetMarkerLoop()
+    {
+        while (true)
+        {
+            yield return FcsRuntimeClock.WaitForSeconds(0.5f);
+            MapTable.SetGunTargetMarker(1, ActiveAim(LeftTask));
+            MapTable.SetGunTargetMarker(2, ActiveAim(RightTask));
+        }
+    }
+
+    private static Vector3? ActiveAim(ArtilleryTask? task) =>
+        task is { hasAimPoint: true } && task.progress is not (Progress.Finished or Progress.Failed)
+            ? task.aimLocal
+            : null;
 
     /// <summary>
     /// LLM-initiated aim adjustment on an already-queued or in-preparation task (by unique
