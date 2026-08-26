@@ -236,17 +236,39 @@ public class MapTable {
     public void ApplyMotionModel(ArtilleryTask task, float prepSeconds) {
         if (!task.hasMotion || !task.hasAimPoint)
             return;
-        var flightSeconds = task.distance > 0.1f ? task.distance / ShellSpeedKmPerSec : 30f;
-        var horizon = MissionNow - task.motionT0 + prepSeconds + flightSeconds;
-        var lead = task.motionVelLocalPerSec * horizon;
-        lead.z = 0;
-        if (lead.magnitude > MaxLeadLocalUnits)
-            lead = lead.normalized * MaxLeadLocalUnits;
-        var aim = task.motionOriginLocal + lead;
-        aim.x = Mathf.Clamp(aim.x, MapLocalMinX, MapLocalMaxX);
-        aim.y = Mathf.Clamp(aim.y, MapLocalMinY, MapLocalMaxY);
-        aim.z = task.aimLocal.z;
+        // Two passes: the lead shifts the range and the range shifts the flight time —
+        // one fixed-point iteration closes most of that residual for fast targets.
+        var aim = task.aimLocal;
+        var distanceKm = task.distance;
+        for (var pass = 0; pass < 2; pass++) {
+            var horizon = MissionNow - task.motionT0 + prepSeconds + FlightSecondsFor(task, distanceKm);
+            var lead = task.motionVelLocalPerSec * horizon;
+            lead.z = 0;
+            if (lead.magnitude > MaxLeadLocalUnits)
+                lead = lead.normalized * MaxLeadLocalUnits;
+            aim = task.motionOriginLocal + lead;
+            aim.x = Mathf.Clamp(aim.x, MapLocalMinX, MapLocalMaxX);
+            aim.y = Mathf.Clamp(aim.y, MapLocalMinY, MapLocalMaxY);
+            aim.z = task.aimLocal.z;
+            var toAim = aim - GetTurretLocalOnMap();
+            distanceKm = new Vector2(toAim.x, toAim.y).magnitude * 3.8164f;
+        }
         task.aimLocal = aim;
+    }
+
+    /// <summary>
+    /// Charge-aware flight time from the measured TTI coefficients (1.43–4.76 s/km).
+    /// The old flat 0.4 km/s (2.5 s/km) underestimated C1/C2 flight by up to ~2x — the
+    /// systematic "shell lands behind the mover" error. Falls back to the minimum viable
+    /// charge for the range when the planner hasn't stamped chargeCount yet.
+    /// </summary>
+    private static float FlightSecondsFor(ArtilleryTask task, float distanceKm) {
+        var charge = task.chargeCount is >= 1 and <= 6
+            ? task.chargeCount
+            : Mathf.Clamp(Mathf.CeilToInt(distanceKm / 5f), 1, 6);
+        return TimeToImpactEstimator.TryEstimateSeconds(distanceKm, charge, out var tti)
+            ? tti
+            : distanceKm > 0.1f ? distanceKm / ShellSpeedKmPerSec : 30f;
     }
 
     /// <summary>
