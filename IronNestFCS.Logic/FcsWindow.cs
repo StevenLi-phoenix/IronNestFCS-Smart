@@ -92,8 +92,8 @@ public class FcsWindow
             {
                 var position = ConvertPosition(item.position);
                 Label(FcsLocalization.T(
-                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°",
-                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°"));
+                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°{item.MotionSuffix(true)}",
+                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°{item.MotionSuffix(false)}"));
             }
         }
     }
@@ -148,8 +148,8 @@ public class FcsWindow
         var flightZh = float.IsNaN(estimatedFlightSeconds) ? "--" : $"{estimatedFlightSeconds:F1}秒";
         var flightEn = float.IsNaN(estimatedFlightSeconds) ? "--" : $"{estimatedFlightSeconds:F1}s";
         label(FcsLocalization.T(
-            $"  打击 {position} · 距离 {task.distance:F2}km · 方位 {task.angel:F1}° · 装药量{task.chargeCount} · 仰角{task.elevation:F1}° · 飞行 {flightZh}",
-            $"  Impact {position} · Range {task.distance:F2}km · Az {task.angel:F1}° · C{task.chargeCount} · E{task.elevation:F1}° · Flight {flightEn}"));
+            $"  打击 {position} · 距离 {task.distance:F2}km · 方位 {task.angel:F1}° · 装药量{task.chargeCount} · 仰角{task.elevation:F1}° · 飞行 {flightZh}{task.MotionSuffix(true)}",
+            $"  Impact {position} · Range {task.distance:F2}km · Az {task.angel:F1}° · C{task.chargeCount} · E{task.elevation:F1}° · Flight {flightEn}{task.MotionSuffix(false)}"));
     }
 
     /// <summary>Converts a map coordinate into the grid/sub-grid notation used by the tactical map.</summary>

@@ -21,6 +21,50 @@ internal sealed class FirePlanExecutor
     private const float ElevationTimeoutSeconds = 35f;
     private const float LoadingObservationTimeoutSeconds = 90f;
     private const float AutoFireTimeoutSeconds = 25f;
+    // Manual-fire live tracking: while a moving-target plan waits for the player to pull
+    // the trigger, keep re-laying the gun so a late pull still hits.
+    private const float TrackRelayIntervalSeconds = 3f;
+    private const float TrackAzimuthEpsilonDegrees = 0.1f;
+    private const float TrackDistanceEpsilonKm = 0.03f;
+    private const float TrackElevationEpsilonDegrees = 0.05f;
+    // Residual delay assumed by the pre-fire correction: trigger protocol + a small nudge.
+    private const float PreFirePrepSeconds = 15f;
+    // Residual delay assumed before the big elevation crank: the crank itself + trigger protocol.
+    private const float PreAimPrepSeconds = 35f;
+
+    private sealed class ElevationSolve
+    {
+        public bool Ok;
+        public float Elevation;
+    }
+
+    /// <summary>
+    /// Re-solve elevation on the shared ballistic console for the task's CURRENT solution and
+    /// the plan's already-loaded charge. lockPriority: task priority for pre-aim/pre-fire
+    /// refreshes, 10 for manual-wait re-lays (never delays planning of new tasks).
+    /// </summary>
+    private IEnumerator SolveElevationForLoadedCharge(FirePlan plan, ElevationSolve result, int lockPriority)
+    {
+        result.Ok = false;
+        yield return _fcs.SharedResources.Ballistic.Acquire(lockPriority);
+        try
+        {
+            yield return FcsRuntimeClock.WaitUntilFocused();
+            yield return _fcs.BallisticCalculator.SetDistance(plan.Task.distance);
+            yield return _fcs.BallisticCalculator.SetDirection(plan.Task.angel);
+            yield return _fcs.BallisticCalculator.SetCharge(plan.Charge);
+            yield return _fcs.BallisticCalculator.SetShellType(plan.Task.bulletType);
+            yield return _fcs.BallisticCalculator.Calculate();
+            result.Elevation = _fcs.BallisticCalculator.GetElevation();
+            result.Ok = _fcs.BallisticCalculator.LastCalculationSucceeded
+                        && !float.IsNaN(result.Elevation)
+                        && !float.IsInfinity(result.Elevation);
+        }
+        finally
+        {
+            _fcs.SharedResources.Ballistic.Release();
+        }
+    }
     private const float SameAzimuthToleranceDegrees = 0.09f;
     private const int FireSettlementBufferFrames = 3;
     private const float ReviewLeadTimeBeforeArmSeconds = 1.5f;
@@ -205,7 +249,7 @@ internal sealed class FirePlanExecutor
         if (needsPersistentLoad)
         {
             plan.Task.progress = Progress.SelectingBullet;
-            yield return _fcs.SharedResources.Requisition.Acquire();
+            yield return _fcs.SharedResources.Requisition.Acquire(plan.Task.priority);
             try
             {
                 var attempts = 0;
@@ -291,9 +335,32 @@ internal sealed class FirePlanExecutor
             yield return FcsRuntimeClock.WaitForSeconds(0.25f);
         }
 
+        // Pre-aim refresh for moving targets: loading may have taken minutes, and the
+        // elevation crank itself is the slowest lay. Aim the big move at the freshest
+        // solution so the pre-fire correction afterwards stays a small, fast nudge.
+        var aimElevation = plan.Elevation;
+        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+        {
+            if (plan.Task.trackEntityId.Length > 0)
+                _fcs.MapTable.UpdateEntityMotion(plan.Task);
+            _fcs.MapTable.ApplyMotionModel(plan.Task, PreAimPrepSeconds);
+            _fcs.MapTable.RefreshSolution(plan.Task);
+            var aimSolve = new ElevationSolve();
+            yield return SolveElevationForLoadedCharge(plan, aimSolve, plan.Task.priority);
+            if (!IsActive(plan))
+                yield break;
+            if (aimSolve.Ok && Mathf.Abs(aimSolve.Elevation - aimElevation) > TrackElevationEpsilonDegrees)
+            {
+                MelonLogger.Msg(
+                    $"[FCS Track] {plan.Label}: pre-aim elevation refresh {aimElevation:F2}° -> {aimSolve.Elevation:F2}°");
+                aimElevation = aimSolve.Elevation;
+                plan.Task.elevation = aimSolve.Elevation;
+            }
+        }
+
         // Left/right elevation are independent. Start immediately at physical LoadedReady.
         plan.Task.progress = Progress.Aiming;
-        yield return gun.SetElevation(plan.Elevation, ElevationTimeoutSeconds);
+        yield return gun.SetElevation(aimElevation, ElevationTimeoutSeconds);
 
         // A different gun may have been physically fired while this plan was still preparing. If the physical
         // settlement consumed this plan, do not turn cancellation into a false elevation failure.
@@ -302,7 +369,7 @@ internal sealed class FirePlanExecutor
 
         if (!gun.LastElevationSucceeded)
         {
-            FailPlan(plan, $"elevation did not reach {plan.Elevation:F1}°");
+            FailPlan(plan, $"elevation did not reach {aimElevation:F1}°");
             yield break;
         }
 
@@ -348,6 +415,57 @@ internal sealed class FirePlanExecutor
             yield return null;
         }
 
+        // Pre-fire correction for moving targets. Loading and the big elevation crank ran on
+        // the plan-time solution and can take minutes — most of the drift accumulates exactly
+        // there. Now that the gun is loaded, elevated and coarsely rotated, re-solve once so
+        // only a SMALL, fast nudge remains before the trigger protocol.
+        var appliedAzimuth = plan.Azimuth;
+        // task.elevation tracks what was actually laid (pre-aim refresh may have moved it).
+        var appliedElevation = plan.Task.elevation > 0f ? plan.Task.elevation : plan.Elevation;
+        var appliedDistance = plan.Task.distance;
+        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+        {
+            if (plan.Task.trackEntityId.Length > 0)
+                _fcs.MapTable.UpdateEntityMotion(plan.Task);
+            _fcs.MapTable.ApplyMotionModel(plan.Task, PreFirePrepSeconds);
+            _fcs.MapTable.RefreshSolution(plan.Task);
+
+            if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)
+            {
+                MelonLogger.Msg(
+                    $"[FCS Track] {plan.Label}: pre-fire azimuth correction {appliedAzimuth:F2}° -> {plan.Task.angel:F2}°");
+                yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+                    plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                    yield break;
+                if (_fcs.Turret.LastRotationSucceeded)
+                    appliedAzimuth = plan.Task.angel;
+            }
+
+            var preFireSolve = new ElevationSolve();
+            yield return SolveElevationForLoadedCharge(plan, preFireSolve, plan.Task.priority);
+            if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                yield break;
+            if (preFireSolve.Ok)
+            {
+                appliedDistance = plan.Task.distance;
+                if (Mathf.Abs(preFireSolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                {
+                    MelonLogger.Msg(
+                        $"[FCS Track] {plan.Label}: pre-fire elevation correction {appliedElevation:F2}° -> {preFireSolve.Elevation:F2}°");
+                    var correctionGun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
+                    yield return correctionGun.SetElevation(preFireSolve.Elevation, ElevationTimeoutSeconds);
+                    if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                        yield break;
+                    if (correctionGun.LastElevationSucceeded)
+                    {
+                        appliedElevation = preFireSolve.Elevation;
+                        plan.Task.elevation = preFireSolve.Elevation;
+                    }
+                }
+            }
+        }
+
         var fireWaitToken = 0;
         var autoFireIssued = false;
         PhysicalFireWatch? leftWatch = null;
@@ -355,7 +473,7 @@ internal sealed class FirePlanExecutor
 
         try
         {
-            yield return _fcs.SharedResources.Trigger.Acquire();
+            yield return _fcs.SharedResources.Trigger.Acquire(plan.Task.priority);
             try
             {
                 if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
@@ -439,6 +557,7 @@ internal sealed class FirePlanExecutor
                 ? FcsRuntimeClock.Now + AutoFireTimeoutSeconds
                 : null;
             var resumeGeneration = FcsRuntimeClock.ResumeGeneration;
+            var nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
 
             while (true)
             {
@@ -480,6 +599,59 @@ internal sealed class FirePlanExecutor
                     yield break;
                 }
 
+                // Manual fire on a moving target: the player decides WHEN, so the gun must keep
+                // following the motion model until the trigger is pulled. Azimuth is pure
+                // geometry; elevation re-solves on the ballistic console at LOW priority (10)
+                // so live re-lay never delays planning of new tasks.
+                if (!autoFireDeadline.HasValue
+                    && (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+                    && FcsRuntimeClock.Now >= nextRelay)
+                {
+                    nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
+                    if (plan.Task.trackEntityId.Length > 0)
+                        _fcs.MapTable.UpdateEntityMotion(plan.Task);
+                    _fcs.MapTable.ApplyMotionModel(plan.Task);
+                    _fcs.MapTable.RefreshSolution(plan.Task);
+
+                    if (Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel)) > TrackAzimuthEpsilonDegrees)
+                    {
+                        MelonLogger.Msg(
+                            $"[FCS Track] {plan.Label}: manual-wait azimuth re-lay {appliedAzimuth:F2}° -> {plan.Task.angel:F2}°");
+                        yield return _fcs.Turret.SetRotation(plan.Task.angel, 45f, () =>
+                            plan.Failed || !ReferenceEquals(_current, plan) || !IsActive(plan));
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (_fcs.Turret.LastRotationSucceeded)
+                            appliedAzimuth = plan.Task.angel;
+                    }
+
+                    if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
+                    {
+                        var relaySolve = new ElevationSolve();
+                        yield return SolveElevationForLoadedCharge(plan, relaySolve, 10);
+                        if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                            yield break;
+                        if (relaySolve.Ok)
+                        {
+                            appliedDistance = plan.Task.distance;
+                            if (Mathf.Abs(relaySolve.Elevation - appliedElevation) > TrackElevationEpsilonDegrees)
+                            {
+                                MelonLogger.Msg(
+                                    $"[FCS Track] {plan.Label}: manual-wait elevation re-lay {appliedElevation:F2}° -> {relaySolve.Elevation:F2}°");
+                                var gun = plan.Side == LeftRight.Left ? _fcs.LeftGun : _fcs.RightGun;
+                                yield return gun.SetElevation(relaySolve.Elevation, ElevationTimeoutSeconds);
+                                if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                                    yield break;
+                                if (gun.LastElevationSucceeded)
+                                {
+                                    appliedElevation = relaySolve.Elevation;
+                                    plan.Task.elevation = relaySolve.Elevation;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 yield return FcsRuntimeClock.WaitForSeconds(0.1f);
             }
         }
@@ -499,7 +671,7 @@ internal sealed class FirePlanExecutor
 
         // The first check prevents pointless Trigger-lane work. It is not authorization: the live relationship may
         // change while this coroutine waits for the shared physical console lane.
-        yield return _fcs.SharedResources.Trigger.Acquire();
+        yield return _fcs.SharedResources.Trigger.Acquire(follower.Task.priority);
         try
         {
             current = _current;

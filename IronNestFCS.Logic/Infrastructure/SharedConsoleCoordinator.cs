@@ -87,7 +87,7 @@ internal sealed class SharedConsoleCoordinator {
                 $"[FCS] console card request: {request.CardId} P{request.Priority}" +
                 (request.BearingDeg is { } b ? $" bearing {b:F1}掳" : ""));
 
-            yield return Requisition.Acquire();
+            yield return Requisition.Acquire(request.Priority);
             try {
                 yield return FcsRuntimeClock.WaitUntilFocused();
                 yield return _fcs.PurchaseDeck.BuyCardById(request.CardId, request.BearingDeg, request.StartGrid, result => {
@@ -111,7 +111,8 @@ internal sealed class SharedConsoleCoordinator {
 
             MelonLogger.Msg(
                 $"[FCS] AutoReplenish: powder charges {charges} < {PowderReplenishThreshold}, buying one");
-            yield return Requisition.Acquire();
+            // Background top-up: always yields to task loading and card requests.
+            yield return Requisition.Acquire(20);
             try {
                 yield return FcsRuntimeClock.WaitUntilFocused();
                 yield return _fcs.PurchaseDeck.BuyPowders();

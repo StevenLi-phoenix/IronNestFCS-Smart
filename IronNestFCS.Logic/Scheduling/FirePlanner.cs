@@ -310,7 +310,7 @@ internal sealed class FirePlanner
         int charge,
         BallisticSolveResult result)
     {
-        yield return _fcs.SharedResources.Ballistic.Acquire();
+        yield return _fcs.SharedResources.Ballistic.Acquire(task.priority);
         try
         {
             yield return FcsRuntimeClock.WaitUntilFocused();

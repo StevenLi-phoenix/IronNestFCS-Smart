@@ -120,6 +120,135 @@ public class MapTable {
         return task;
     }
 
+    // ---- Moving-target motion models ----
+
+    private const float TrackPrepSeconds = 45f;        // buy/load/aim before the shot leaves
+    private const float ShellSpeedKmPerSec = 0.4f;     // coarse average for flight-time estimate
+    private const float MaxLeadLocalUnits = 3f / 3.8164f;         // never lead further than 3 km
+    private const float TrackingLostAfterSeconds = 90f;           // fog extrapolation gets flagged
+    private const float MapLocalMinX = (-1f - 10.016f) / 3.8164f; // km-frame envelope, local units
+    private const float MapLocalMaxX = (27f - 10.016f) / 3.8164f;
+    private const float MapLocalMinY = (-1f - 5.235f) / 3.8164f;
+    private const float MapLocalMaxY = (16f - 5.235f) / 3.8164f;
+
+    /// <summary>
+    /// Game clock in seconds-of-day — the 24h world clock (GenericTimerSceneSync, the same
+    /// clock the telegraph references and the bridge stamps on agent events). Falls back to
+    /// the mission stopwatch, then realtime.
+    /// </summary>
+    private static GenericTimerSceneSync? _worldClock;
+    public static float MissionNow {
+        get {
+            try {
+                if (_worldClock == null)
+                    foreach (var sync in UnityEngine.Object.FindObjectsOfType<GenericTimerSceneSync>())
+                        if (_worldClock == null || sync.CurrentTime > _worldClock.CurrentTime)
+                            _worldClock = sync;
+                if (_worldClock != null && _worldClock.CurrentTime > 0f)
+                    return _worldClock.CurrentTime;
+            }
+            catch { _worldClock = null; }
+            try {
+                var tracker = MissionStatsTracker.Instance;
+                if (tracker != null && tracker.timerRunning)
+                    return tracker.timerValue;
+            }
+            catch { }
+            return Time.realtimeSinceStartup;
+        }
+    }
+
+    private readonly Dictionary<string, (Vector3 local, float t)> _entitySamples = new();
+
+    /// <summary>
+    /// Refit a tracked task's motion model from the live entity. While visible: origin/vel
+    /// re-sampled (velocity low-passed to damp map jitter). Fogged or dead: the existing
+    /// model keeps extrapolating; trackingLost flags stale models.
+    /// </summary>
+    public void UpdateEntityMotion(ArtilleryTask task) {
+        if (task.trackEntityId.Length == 0 || fireMissionRoot == null || mapSurface == null)
+            return;
+
+        var now = MissionNow;
+        task.trackingLost = task.hasMotion && now - task.motionT0 > TrackingLostAfterSeconds;
+
+        for (var i = 0; i < fireMissionRoot.childCount; i++) {
+            var child = fireMissionRoot.GetChild(i);
+            var loc = child.GetComponent<EntityLocation>();
+            if (loc == null) continue;
+            MapEntity? entity = null;
+            try { entity = loc.Entity; } catch { }
+            if (entity == null) continue;
+            string? id = null, rawId = null;
+            try { id = entity.ID; rawId = entity.RawID; } catch { }
+            if (id != task.trackEntityId && rawId != task.trackEntityId) continue;
+
+            bool visible = false, alive = true;
+            try {
+                alive = entity.IsAlive;
+                visible = loc.VisualRoot != null && loc.VisualRoot.activeInHierarchy;
+                if (visible && loc.VisibilityGroup != null)
+                    visible = loc.VisibilityGroup.alpha > 0.05f;
+            }
+            catch { }
+            if (!visible || !alive)
+                return; // fog/dead: leave the last model extrapolating
+
+            var local = mapSurface.InverseTransformPoint(child.position);
+            if (_entitySamples.TryGetValue(task.trackEntityId, out var prev)) {
+                var dt = now - prev.t;
+                if (dt >= 0.5f && dt <= 10f) {
+                    var vel = (local - prev.local) / dt;
+                    vel.z = 0;
+                    task.motionVelLocalPerSec = task.hasMotion
+                        ? Vector3.Lerp(task.motionVelLocalPerSec, vel, 0.5f)
+                        : vel;
+                    _entitySamples[task.trackEntityId] = (local, now);
+                }
+                else if (dt > 10f) {
+                    // stale sample (pause/reload) — restart the fit rather than a wild velocity
+                    task.motionVelLocalPerSec = Vector3.zero;
+                    _entitySamples[task.trackEntityId] = (local, now);
+                }
+            }
+            else {
+                _entitySamples[task.trackEntityId] = (local, now);
+                task.motionVelLocalPerSec = Vector3.zero;
+            }
+
+            task.motionOriginLocal = local;
+            task.motionT0 = now;
+            task.hasMotion = true;
+            task.trackingLost = false;
+            return;
+        }
+        // entity not found at all — keep extrapolating the last model
+    }
+
+    /// <summary>
+    /// Extrapolate the aim point to the predicted impact time: now + prep + flight.
+    /// Lead displacement is capped and the result clamped to the map envelope.
+    /// prepSeconds = the remaining delay before the shot leaves: the full prep estimate
+    /// while queued, a short residual during pre-fire/manual-wait corrections.
+    /// </summary>
+    public void ApplyMotionModel(ArtilleryTask task) => ApplyMotionModel(task, TrackPrepSeconds);
+
+    public void ApplyMotionModel(ArtilleryTask task, float prepSeconds) {
+        if (!task.hasMotion || !task.hasAimPoint)
+            return;
+        var flightSeconds = task.distance > 0.1f ? task.distance / ShellSpeedKmPerSec : 30f;
+        var horizon = MissionNow - task.motionT0 + prepSeconds + flightSeconds;
+        var lead = task.motionVelLocalPerSec * horizon;
+        lead.z = 0;
+        if (lead.magnitude > MaxLeadLocalUnits)
+            lead = lead.normalized * MaxLeadLocalUnits;
+        var aim = task.motionOriginLocal + lead;
+        aim.x = Mathf.Clamp(aim.x, MapLocalMinX, MapLocalMaxX);
+        aim.y = Mathf.Clamp(aim.y, MapLocalMinY, MapLocalMaxY);
+        aim.z = task.aimLocal.z;
+        task.aimLocal = aim;
+    }
+
     /// <summary>
     /// Late-bound solution refresh: recompute angel/distance from the task's fixed aim
     /// point and the turret piece's CURRENT position. Called each planning round so a
