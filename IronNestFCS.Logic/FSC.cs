@@ -148,6 +148,7 @@ public class FSC
             SceneInteractor.RefreshBulletTypeButtons();
         SceneInteractor.Update();
         PlanExecutor.Tick();
+        Dispatcher.SweepExpiredTasks();
         CaptureEstimatedFlightTime(LeftRight.Left);
         CaptureEstimatedFlightTime(LeftRight.Right);
     }
