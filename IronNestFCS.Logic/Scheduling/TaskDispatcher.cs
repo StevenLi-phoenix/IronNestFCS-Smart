@@ -69,6 +69,8 @@ internal sealed class TaskDispatcher
     {
         if (task.serial == 0)
             task.serial = ++_serialCounter;
+        if (task.firstEnqueuedAt == 0f)
+            task.firstEnqueuedAt = FcsRuntimeClock.Now;
         task.progress = Progress.Pending;
         task.pendingHint = PendingHint.None;
         task.startedAt = FcsRuntimeClock.Now;
@@ -150,6 +152,9 @@ internal sealed class TaskDispatcher
         // under it — one snapshot copy is all the isolation it needs.
         foreach (var task in _taskQueue.ToArray())
         {
+            if (TryExpireTask(task))
+                continue;
+
             var result = _fcs.Planner.BuildEligibility(task, snapshot);
             planningResults.Add(result);
 
@@ -665,6 +670,35 @@ internal sealed class TaskDispatcher
         }
 
         return removed;
+    }
+
+    // Time-sensitive missions carry a queue-validity window (validForSeconds > 0): once it
+    // elapses while the task is still waiting, firing late is worse than not firing (the
+    // moving cluster left, the window closed) — auto-cancel with a reason the agent hears.
+    private bool TryExpireTask(ArtilleryTask task)
+    {
+        if (task.validForSeconds <= 0f
+            || FcsRuntimeClock.Now - task.firstEnqueuedAt <= task.validForSeconds)
+            return false;
+
+        task.progress = Progress.Failed;
+        task.failureReason = $"时效已过: 入队{task.validForSeconds:F0}秒仍未上炮, 时敏任务自动撤销";
+        RemovePendingTask(task);
+        RecordTaskResult(task);
+        MelonLogger.Warning($"[FCS Dispatch] #{task.serial} expired after {task.validForSeconds:F0}s in queue; auto-cancelled");
+        return true;
+    }
+
+    private float _nextExpirySweep;
+
+    /// <summary>Per-second queue sweep so expiry also fires while no planning round runs.</summary>
+    public void SweepExpiredTasks()
+    {
+        if (FcsRuntimeClock.Now < _nextExpirySweep)
+            return;
+        _nextExpirySweep = FcsRuntimeClock.Now + 1f;
+        foreach (var task in _taskQueue.ToArray())
+            TryExpireTask(task);
     }
 
     public void RecordTaskResult(ArtilleryTask task)

@@ -111,6 +111,13 @@ public class ArtilleryTask {
     // replenishes) get a bounded number of automatic requeues before failing for real.
     public int loadRetryCount;
 
+    // Optional queue-validity window for time-sensitive missions: >0 means the task
+    // self-cancels if it is STILL WAITING in the queue this many seconds after its first
+    // enqueue. Tasks already on a gun are never expired. firstEnqueuedAt survives
+    // preemption re-enqueues so the window measures from the original order.
+    public float validForSeconds;
+    public float firstEnqueuedAt;
+
     // Runtime-only dispatch memory. If a preloaded gun is tried and its fixed shell/charge cannot
     // solve the target, exclude that side and let the same task fall back to the other gun.
     // Bit 0 = Left, bit 1 = Right. Reset when a brand-new target is enqueued.
