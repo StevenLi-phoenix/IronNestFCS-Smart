@@ -118,6 +118,11 @@ internal sealed class TaskDispatcher
         // below. Clear only that consumed edge; a later enqueue during materialization will set it again.
         _dispatchRequested = false;
 
+        // Late-bound solutions: re-derive every pending task's angel/distance from its
+        // fixed aim point and the turret piece's current position before matching.
+        foreach (var pending in _taskQueue)
+            _fcs.MapTable.RefreshSolution(pending);
+
         var snapshot = _fcs.Planner.CaptureSnapshot();
         var attempted = new HashSet<ArtilleryTask>();
         var planningResults = new List<TaskPlanningResult>();
