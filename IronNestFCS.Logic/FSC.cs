@@ -206,17 +206,18 @@ public class FSC
     public string? CancelPendingTask(int serial) => Dispatcher.CancelPendingBySerial(serial);
 
     /// <summary>
-    /// T1/T2 are FCS-owned gun target markers: T1 tracks the left gun's current aim, T2 the
-    /// right gun's. After the shot they stay put — the resting marker shows the in-flight
-    /// shell's planned impact point until the next task moves it. T3+ stay player-owned.
+    /// T9/T10 are FCS-owned gun target markers: T9 tracks the left gun's current aim, T10
+    /// the right gun's. After the shot they stay put — the resting marker shows the
+    /// in-flight shell's planned impact point until the next task moves it. T1–T8 stay
+    /// player-owned. On maps without tokens 9/10 the calls are safe no-ops.
     /// </summary>
     private IEnumerator GunTargetMarkerLoop()
     {
         while (true)
         {
             yield return FcsRuntimeClock.WaitForSeconds(0.5f);
-            MapTable.SetGunTargetMarker(1, ActiveAim(LeftTask));
-            MapTable.SetGunTargetMarker(2, ActiveAim(RightTask));
+            MapTable.SetGunTargetMarker(9, ActiveAim(LeftTask));
+            MapTable.SetGunTargetMarker(10, ActiveAim(RightTask));
         }
     }
 
