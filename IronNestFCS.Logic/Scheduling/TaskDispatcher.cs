@@ -453,6 +453,36 @@ internal sealed class TaskDispatcher
         return null;
     }
 
+    /// <summary>
+    /// Commander-initiated cancellation of a PENDING task (not yet on a gun) by target id.
+    /// Removes the first queue match and returns its description; executing plans are
+    /// untouched (preemption handles those). Not counted as a failure.
+    /// </summary>
+    public string? CancelPendingByTargetId(int targetId)
+    {
+        var items = _taskQueue.ToArray();
+        _taskQueue.Clear();
+
+        ArtilleryTask? cancelled = null;
+        foreach (var task in items)
+        {
+            if (cancelled == null && task.targetId == targetId)
+            {
+                cancelled = task;
+                continue;
+            }
+            _taskQueue.Enqueue(task);
+        }
+
+        if (cancelled == null)
+            return null;
+
+        cancelled.progress = Progress.Failed;
+        cancelled.failureReason = "cancelled by commander";
+        MelonLogger.Msg($"[FCS Dispatch] pending T{targetId} cancelled by commander; pending={_taskQueue.Count}");
+        return $"T{cancelled.targetId} {cancelled.bulletType.DisplayName()} brg {cancelled.angel:F1} dist {cancelled.distance:F2}km";
+    }
+
     private bool RemovePendingTask(ArtilleryTask target)
     {
         var items = _taskQueue.ToArray();

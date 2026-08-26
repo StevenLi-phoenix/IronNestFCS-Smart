@@ -123,6 +123,7 @@ public class FSC
             TrackCoroutine(SharedResources.ResetFireControlsAfterBind());
             TrackCoroutine(TriggerConsole.ReviewStateLoop());
             TrackCoroutine(SharedResources.ReplenishPowderLoop());
+            TrackCoroutine(SharedResources.ConsoleCardRequestLoop());
         }
 
         return IsBound;
@@ -196,6 +197,25 @@ public class FSC
     }
 
     public void EnqueueTask(ArtilleryTask task) => Dispatcher.EnqueueTask(task);
+
+    public string? CancelPendingTask(int targetId) => Dispatcher.CancelPendingByTargetId(targetId);
+
+    /// <summary>External punchcard purchase (e.g. scout plane): queued into the console coordinator.</summary>
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, 50);
+
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority)
+    {
+        SharedResources.EnqueueCardRequest(new Infrastructure.ConsoleCardRequest
+        {
+            CardId = cardId,
+            BearingDeg = hasBearing ? bearingDeg : null,
+            Priority = priority,
+        });
+        return $"queued to FCS console coordinator (P{priority})";
+    }
+
+    public string ConsoleCardRequestResult => SharedResources.LastCardRequestResult;
 
     public IEnumerator ExposeAllEntities() => _sceneExposure.ExposeAllEntities();
 }
