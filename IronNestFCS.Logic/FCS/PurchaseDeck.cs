@@ -230,7 +230,23 @@ public class PurchaseDeck {
     /// verifying via the bridge's own value and correcting through its internal setter.
     /// Caller must hold the Requisition lock. Reports the outcome through done().
     /// </summary>
-    public IEnumerator BuyCardById(string cardId, float? bearingDeg, Action<string> done) {
+    /// <summary>Drive one grid split-flap dial (letter or number) to a symbol via its binder.</summary>
+    private static string SetFlapDialSymbol(DialToSplitFlipDisplayBinder binder, string symbol) {
+        var symbols = binder.orderedSymbols ?? "";
+        var index = symbols.IndexOf(symbol, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+            return $"symbol '{symbol}' not in [{symbols}]";
+        var min = binder.outputRangeMin;
+        var max = binder.outputRangeMax;
+        var value = symbols.Length > 1 ? min + (max - min) * index / (symbols.Length - 1) : min;
+        // Verify the mapping with the binder's own function and nudge if rounding lands off.
+        for (var attempt = 0; attempt < 5 && binder.MapDialValueToSymbolIndex(value) != index; attempt++)
+            value += (max - min) / (symbols.Length * 4f) * (binder.MapDialValueToSymbolIndex(value) < index ? 1f : -1f);
+        binder.dial?.SetDialValue(value);
+        return "ok";
+    }
+
+    public IEnumerator BuyCardById(string cardId, float? bearingDeg, string? startGrid, Action<string> done) {
         if (_requisitionConsole == null) {
             done("requisition console unbound");
             yield break;
@@ -292,6 +308,33 @@ public class PurchaseDeck {
             }
             MelonLogger.Msg($"[FCS] card bearing requested {bearing:F1} applied {applied:F1}");
             yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+        }
+
+        if (!string.IsNullOrWhiteSpace(startGrid)) {
+            var m = System.Text.RegularExpressions.Regex.Match(startGrid!.Trim(), @"^([A-Za-z])\s*(\d{1,2})$");
+            if (!m.Success) {
+                done($"cannot parse startGrid '{startGrid}' (expected like 'P4')");
+                yield break;
+            }
+            DialToSplitFlipDisplayBinder? letterBinder = null, numberBinder = null;
+            foreach (var binder in UnityEngine.Object.FindObjectsOfType<DialToSplitFlipDisplayBinder>()) {
+                var parent = binder.transform.parent;
+                var parentName = parent != null ? parent.name : "";
+                if (parentName.Contains("Location L")) letterBinder = binder;
+                else if (parentName.Contains("Location N")) numberBinder = binder;
+            }
+            if (letterBinder == null || numberBinder == null) {
+                done("start-grid dials not found (card may not support a start position)");
+                yield break;
+            }
+            var letterResult = SetFlapDialSymbol(letterBinder, m.Groups[1].Value.ToUpperInvariant());
+            var numberResult = SetFlapDialSymbol(numberBinder, m.Groups[2].Value);
+            MelonLogger.Msg($"[FCS] card start grid '{startGrid}': letter={letterResult}, number={numberResult}");
+            if (letterResult != "ok" || numberResult != "ok") {
+                done($"start grid failed: letter={letterResult}, number={numberResult}");
+                yield break;
+            }
+            yield return FcsRuntimeClock.WaitForSeconds(0.4f);
         }
 
         yield return FcsSceneInteractor.WaitAndClick(_buyButton);
