@@ -6,6 +6,7 @@ using System.Collections;
 using IronNestFCS.Abstractions;
 using IronNestFCS.Logic.FCS;
 using MelonLoader;
+using UnityEngine;
 
 namespace IronNestFCS.Logic.Scheduling;
 
@@ -137,6 +138,7 @@ internal sealed class TaskDispatcher
         }
 
         var snapshot = _fcs.Planner.CaptureSnapshot();
+        PlanEngagementOrder(snapshot);
         var planningResults = new List<TaskPlanningResult>();
         // Retry ownership belongs to a free transient gun side, not to whether a particular task had zero
         // candidates. A task may be eligible on Left while Right is still recovering; if Right opens during
@@ -297,6 +299,188 @@ internal sealed class TaskDispatcher
         }
 
         _fcs.PlanExecutor.EvaluateScheduling();
+    }
+
+    /// <summary>
+    /// 炮击顺序规划 (engagement sequencing). Between consecutive shots the turret slews
+    /// azimuth and cranks elevation IN PARALLEL, so the per-transition lay time is
+    /// max(Δbearing/ωH, |Δelevation|/ωV) — a 2D sequence optimization under the
+    /// Chebyshev-style metric (ωH=4°/s, ωV=2°/s from FireReadyEstimator). Priority
+    /// bands are a hard outer order; within a band the path is solved EXACTLY by
+    /// Held-Karp DP (bands are small; greedy fallback beyond ExactSequenceLimit).
+    /// Elevation is not solved yet at queue time, so it is estimated from the verified
+    /// linear ballistic model (distance*12/charge, min-viable or max charge).
+    /// The queue itself is rebuilt in the planned order, so the HUD, the agent snapshot
+    /// and matcher tie-breaking all follow one sequence. Runs every planning round on
+    /// fresh solutions — recalibration, re-aims and cancellations re-plan automatically.
+    /// </summary>
+    private const int ExactSequenceLimit = 10;
+
+    private void PlanEngagementOrder(FirePlanningSnapshot snapshot)
+    {
+        if (_taskQueue.Count < 2)
+            return;
+
+        var before = _taskQueue.Select(t => t.serial).ToArray();
+        var ordered = new List<ArtilleryTask>(_taskQueue.Count);
+        // Cursor in bearing space: the physical turret angle maps to bearing as its
+        // negation (same convention as FireReadyEstimator.AzimuthSeconds).
+        var cursorBearing = -snapshot.CurrentAzimuth;
+        var cursorElevation = StartElevation(snapshot);
+        var totalSeconds = 0f;
+
+        foreach (var band in _taskQueue.GroupBy(t => t.priority).OrderByDescending(g => g.Key))
+        {
+            var tasks = band.OrderBy(t => t.serial).ToArray();
+            var elevations = new float[tasks.Length];
+            for (var i = 0; i < tasks.Length; i++)
+                elevations[i] = EstimateElevation(tasks[i]);
+
+            var path = tasks.Length <= ExactSequenceLimit
+                ? SolveExactPath(tasks, elevations, cursorBearing, cursorElevation, out var pathSeconds)
+                : SolveGreedyPath(tasks, elevations, cursorBearing, cursorElevation, out pathSeconds);
+            totalSeconds += pathSeconds;
+
+            foreach (var index in path)
+                ordered.Add(tasks[index]);
+            var last = path[^1];
+            cursorBearing = tasks[last].angel;
+            cursorElevation = elevations[last];
+        }
+
+        if (ordered.Select(t => t.serial).SequenceEqual(before))
+            return;
+
+        _taskQueue.Clear();
+        foreach (var task in ordered)
+            _taskQueue.Enqueue(task);
+        MelonLogger.Msg($"[FCS Order] engagement sequence (est lay {totalSeconds:F0}s): " +
+            string.Join(" -> ", ordered.Select(t => $"#{t.serial}(P{t.priority} {t.angel:F0}deg)")));
+    }
+
+    /// <summary>Per-transition lay time: both axes travel in parallel, the slower gates.</summary>
+    private static float TransitionSeconds(float fromBearing, float fromElevation, float toBearing, float toElevation)
+    {
+        return Mathf.Max(
+            Mathf.Abs(Mathf.DeltaAngle(fromBearing, toBearing)) / FireReadyEstimator.AzimuthSlewDegreesPerSecond,
+            Mathf.Abs(fromElevation - toElevation) / FireReadyEstimator.ElevationSlewDegreesPerSecond);
+    }
+
+    /// <summary>Queue-time elevation estimate from the verified linear model (task charge is unsolved yet).</summary>
+    private float EstimateElevation(ArtilleryTask task)
+    {
+        var charge = _fcs.MaxChargeEnabled ? 6 : BallisticCalculator.MinimumCharge(task.distance);
+        if (charge <= 0)
+            charge = 6;
+        return Mathf.Min(task.distance * 12f / charge, 60f);
+    }
+
+    private static float StartElevation(FirePlanningSnapshot snapshot)
+    {
+        // The sequencer does not know gun assignment; start from the free gun's barrel,
+        // or the average when both/neither slot is free.
+        if (snapshot.LeftSlotAvailable && !snapshot.RightSlotAvailable)
+            return snapshot.LeftPhysical.Elevation;
+        if (snapshot.RightSlotAvailable && !snapshot.LeftSlotAvailable)
+            return snapshot.RightPhysical.Elevation;
+        return (snapshot.LeftPhysical.Elevation + snapshot.RightPhysical.Elevation) * 0.5f;
+    }
+
+    /// <summary>Held-Karp open-path DP: exact minimum total lay time for one priority band.</summary>
+    private static int[] SolveExactPath(
+        ArtilleryTask[] tasks, float[] elevations, float startBearing, float startElevation, out float bestSeconds)
+    {
+        var n = tasks.Length;
+        var cost = new float[n + 1, n]; // row n = from the start cursor
+        for (var j = 0; j < n; j++)
+            cost[n, j] = TransitionSeconds(startBearing, startElevation, tasks[j].angel, elevations[j]);
+        for (var i = 0; i < n; i++)
+            for (var j = 0; j < n; j++)
+                cost[i, j] = TransitionSeconds(tasks[i].angel, elevations[i], tasks[j].angel, elevations[j]);
+
+        var full = 1 << n;
+        var dp = new float[full, n];
+        var parent = new int[full, n];
+        for (var mask = 0; mask < full; mask++)
+            for (var j = 0; j < n; j++)
+                dp[mask, j] = float.PositiveInfinity;
+        for (var j = 0; j < n; j++)
+            dp[1 << j, j] = cost[n, j];
+
+        for (var mask = 1; mask < full; mask++)
+            for (var last = 0; last < n; last++)
+            {
+                if ((mask & (1 << last)) == 0 || float.IsPositiveInfinity(dp[mask, last]))
+                    continue;
+                for (var next = 0; next < n; next++)
+                {
+                    if ((mask & (1 << next)) != 0)
+                        continue;
+                    var candidate = dp[mask, last] + cost[last, next];
+                    var nextMask = mask | (1 << next);
+                    if (candidate < dp[nextMask, next])
+                    {
+                        dp[nextMask, next] = candidate;
+                        parent[nextMask, next] = last;
+                    }
+                }
+            }
+
+        var bestLast = 0;
+        bestSeconds = float.PositiveInfinity;
+        for (var j = 0; j < n; j++)
+            if (dp[full - 1, j] < bestSeconds)
+            {
+                bestSeconds = dp[full - 1, j];
+                bestLast = j;
+            }
+
+        var path = new int[n];
+        var m = full - 1;
+        var cursor = bestLast;
+        for (var k = n - 1; k >= 0; k--)
+        {
+            path[k] = cursor;
+            var prev = parent[m, cursor];
+            m &= ~(1 << cursor);
+            cursor = prev;
+        }
+        return path;
+    }
+
+    /// <summary>Same metric, nearest-next greedy — fallback for bands too large for exact DP.</summary>
+    private static int[] SolveGreedyPath(
+        ArtilleryTask[] tasks, float[] elevations, float startBearing, float startElevation, out float totalSeconds)
+    {
+        var n = tasks.Length;
+        var path = new int[n];
+        var used = new bool[n];
+        var bearing = startBearing;
+        var elevation = startElevation;
+        totalSeconds = 0f;
+
+        for (var k = 0; k < n; k++)
+        {
+            var best = -1;
+            var bestCost = float.PositiveInfinity;
+            for (var j = 0; j < n; j++)
+            {
+                if (used[j])
+                    continue;
+                var c = TransitionSeconds(bearing, elevation, tasks[j].angel, elevations[j]);
+                if (c < bestCost)
+                {
+                    best = j;
+                    bestCost = c;
+                }
+            }
+            used[best] = true;
+            path[k] = best;
+            totalSeconds += bestCost;
+            bearing = tasks[best].angel;
+            elevation = elevations[best];
+        }
+        return path;
     }
 
     private IEnumerator WaitForMatchCoalesceWindow()

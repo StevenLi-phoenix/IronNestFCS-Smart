@@ -87,8 +87,10 @@ public class FcsWindow
 
         if (queue.Count > 0)
         {
-            Label(FcsLocalization.T($"等待队列：{queue.Count}（按优先级）", $"Pending: {queue.Count} (by priority)"));
-            foreach (var item in queue.OrderByDescending(t => t.priority))
+            // Queue order IS the planned engagement sequence (priority bands, then
+            // nearest-azimuth-next within a band) — display it verbatim.
+            Label(FcsLocalization.T($"等待队列：{queue.Count}（计划炮击顺序）", $"Pending: {queue.Count} (planned engagement order)"));
+            foreach (var item in queue)
             {
                 var position = ConvertPosition(item.position);
                 Label(FcsLocalization.T(
