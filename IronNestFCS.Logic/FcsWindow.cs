@@ -87,13 +87,13 @@ public class FcsWindow
 
         if (queue.Count > 0)
         {
-            Label(FcsLocalization.T($"等待队列：{queue.Count}", $"Pending: {queue.Count}"));
-            foreach (var item in queue)
+            Label(FcsLocalization.T($"等待队列：{queue.Count}（按优先级）", $"Pending: {queue.Count} (by priority)"));
+            foreach (var item in queue.OrderByDescending(t => t.priority))
             {
                 var position = ConvertPosition(item.position);
                 Label(FcsLocalization.T(
-                    $"  T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°",
-                    $"  T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°"));
+                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · 打击 {position} · 距离 {item.distance:F2}km · 方位 {item.angel:F1}°",
+                    $"  P{item.priority} T{item.targetId} {item.bulletType.DisplayName()} · Impact {position} · Range {item.distance:F2}km · Az {item.angel:F1}°"));
             }
         }
     }

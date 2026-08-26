@@ -21,6 +21,7 @@ internal sealed class TaskDispatcher
     private const float MatchCoalescePollSeconds = 0.05f;
     private const int LeftPhysicalRetryBit = 1;
     private const int RightPhysicalRetryBit = 2;
+    private const int UrgentPriorityThreshold = 90;
 
     private readonly FSC _fcs;
     private readonly Queue<ArtilleryTask> _taskQueue = new();
@@ -72,7 +73,16 @@ internal sealed class TaskDispatcher
 
         // Intent-only queue: no gun/loading read here.
         _taskQueue.Enqueue(task);
-        MelonLogger.Msg($"[FCS Dispatch] queued T{task.targetId}; pending={_taskQueue.Count}");
+        MelonLogger.Msg($"[FCS Dispatch] queued T{task.targetId} P{task.priority}; pending={_taskQueue.Count}");
+
+        // Urgent task with both guns busy: try to hijack a matching-load gun before dispatching.
+        // The preempted task re-enters this queue via EnqueueTask (its priority < urgent, so no recursion).
+        if (task.priority >= UrgentPriorityThreshold && !_fcs.PlanExecutor.HasFreeGun
+            && _fcs.PlanExecutor.TryPreemptForUrgent(task, out var preemptDetail))
+        {
+            MelonLogger.Msg($"[FCS Dispatch] urgent T{task.targetId}: {preemptDetail}");
+        }
+
         TryDispatch();
     }
 
@@ -277,7 +287,9 @@ internal sealed class TaskDispatcher
 
     private IEnumerator WaitForMatchCoalesceWindow()
     {
-        if (_taskQueue.Count != 1
+        // Urgent tasks (counter-battery) never wait for a pairing partner.
+        if (_taskQueue.Any(t => t.priority >= UrgentPriorityThreshold)
+            || _taskQueue.Count != 1
             || _fcs.PlanExecutor.GetPlan(LeftRight.Left) != null
             || _fcs.PlanExecutor.GetPlan(LeftRight.Right) != null)
         {

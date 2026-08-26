@@ -693,6 +693,68 @@ internal sealed class FirePlanExecutor
         _autoFireIssuedForWait = false;
     }
 
+    /// <summary>
+    /// Urgent-task preemption: when no gun is free, hijack a busy gun whose physical load
+    /// already satisfies the urgent task (same shell, charge >= the urgent distance's
+    /// minimum — elevation is re-solved with the actual loaded charge on replan).
+    /// Never touches the current shared-azimuth owner or an armed/fire-waiting plan;
+    /// the victim's task returns to the pending queue unfailed.
+    /// </summary>
+    public bool TryPreemptForUrgent(ArtilleryTask urgent, out string detail)
+    {
+        detail = "";
+        if (HasFreeGun)
+        {
+            detail = "a gun is already free";
+            return false;
+        }
+
+        var requiredCharge = BallisticCalculator.MinimumCharge(urgent.distance);
+        FirePlan? victim = null;
+        foreach (var plan in new[] { _leftPlan, _rightPlan })
+        {
+            if (plan == null
+                || plan.Task.priority >= urgent.priority
+                || ReferenceEquals(plan, _fireWaitOwner)   // armed / about to fire
+                || ReferenceEquals(plan, _current)         // owns shared azimuth execution
+                || plan.ShotObserved
+                || plan.Shell != urgent.bulletType
+                || plan.Charge < requiredCharge)
+            {
+                continue;
+            }
+            if (victim == null || plan.Task.priority < victim.Task.priority)
+                victim = plan;
+        }
+
+        if (victim == null)
+        {
+            detail = "no preemptable plan (current/armed, higher priority, or shell/charge mismatch)";
+            return false;
+        }
+
+        var task = victim.Task;
+        MelonLogger.Msg(
+            $"[FCS Plan] {victim.Label} preempted by urgent T{urgent.targetId} P{urgent.priority} " +
+            $"(load {victim.Shell.DisplayName()} C{victim.Charge} transfers; min required C{requiredCharge})");
+
+        CancelPreparation(victim);
+        victim.Failed = true;
+        victim.FailureReason = "preempted by urgent task";
+        if (ReferenceEquals(_fireWaitOwner, victim))
+            ClearAllFireWait();
+        ReleaseGunSlot(victim, notify: false);
+
+        // Return the victim to pending, un-failed — it replans once the urgent shot is away.
+        task.progress = Progress.Pending;
+        task.failureReason = "";
+        task.pendingHint = PendingHint.None;
+        _fcs.Dispatcher.EnqueueTask(task);
+
+        detail = $"preempted {victim.Label}";
+        return true;
+    }
+
     private void FailPlan(FirePlan plan, string reason)
     {
         if (plan.CompletionHandled)
