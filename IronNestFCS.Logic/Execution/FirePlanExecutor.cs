@@ -210,10 +210,25 @@ internal sealed class FirePlanExecutor
         if (active.Count == 0)
             return;
 
-        var committed = active.FirstOrDefault(p => p.Compared);
-        if (committed != null)
+        // Firing order respects task priority ACROSS commit batches, not only within a
+        // compared pair: a committed plan does not outrank a higher-priority plan that
+        // arrived later — the commander's P92→P91 sequencing must hold even when the two
+        // plans were dispatched in separate rounds. Equal priority keeps commit order.
+        var compared = active.Where(p => p.Compared).ToList();
+        if (compared.Count > 0)
         {
-            _next = active.FirstOrDefault(p => !ReferenceEquals(p, committed));
+            var committed = compared.OrderByDescending(p => p.Task.priority).First();
+            var other = active.FirstOrDefault(p => !ReferenceEquals(p, committed));
+            if (other is { Compared: false } && other.Task.priority > committed.Task.priority)
+            {
+                _fcs.FirePriority.CommitSingle(other, "优先级高于已提交计划");
+                MelonLogger.Msg(
+                    $"[FCS Order] priority override: {other.Label} (P{other.Task.priority}) fires before committed {committed.Label} (P{committed.Task.priority})");
+                _next = committed;
+                SetCurrent(other, promote: false);
+                return;
+            }
+            _next = other;
             SetCurrent(committed, promote: true);
             return;
         }
