@@ -229,15 +229,23 @@ public class FSC
         => RequestConsoleCard(cardId, bearingDeg, hasBearing, priority, null);
 
     public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing, int priority, string? startGrid)
+        => RequestConsoleCard(cardId, bearingDeg, hasBearing, 0f, false, priority, startGrid);
+
+    /// <summary>Full form: distance feeds cards like MoveDirection (bearing + distance dials).</summary>
+    public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearing,
+        float distanceKm, bool hasDistance, int priority, string? startGrid)
     {
         SharedResources.EnqueueCardRequest(new Infrastructure.ConsoleCardRequest
         {
             CardId = cardId,
             BearingDeg = hasBearing ? bearingDeg : null,
+            DistanceKm = hasDistance ? distanceKm : null,
             StartGrid = string.IsNullOrWhiteSpace(startGrid) ? null : startGrid,
             Priority = priority,
         });
-        return $"queued to FCS console coordinator (P{priority}{(string.IsNullOrWhiteSpace(startGrid) ? "" : $", start {startGrid}")})";
+        return $"queued to FCS console coordinator (P{priority}" +
+               (hasDistance ? $", dist {distanceKm:F1}km" : "") +
+               (string.IsNullOrWhiteSpace(startGrid) ? "" : $", start {startGrid}") + ")";
     }
 
     public string ConsoleCardRequestResult => SharedResources.LastCardRequestResult;

@@ -249,7 +249,10 @@ public class PurchaseDeck {
         return "ok";
     }
 
-    public IEnumerator BuyCardById(string cardId, float? bearingDeg, string? startGrid, Action<string> done) {
+    public IEnumerator BuyCardById(string cardId, float? bearingDeg, string? startGrid, Action<string> done)
+        => BuyCardById(cardId, bearingDeg, null, startGrid, done);
+
+    public IEnumerator BuyCardById(string cardId, float? bearingDeg, float? distanceKm, string? startGrid, Action<string> done) {
         if (_requisitionConsole == null) {
             done("requisition console unbound");
             yield break;
@@ -306,6 +309,31 @@ public class PurchaseDeck {
             }
             MelonLogger.Msg($"[FCS] card bearing requested {bearing:F1} applied {applied:F1}");
             yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+
+            // Distance dial (MoveDirection-style cards): same physical-first pattern —
+            // dial, verify via the bridge's own value, correct through its internal setter.
+            if (distanceKm is { } distance) {
+                if (bridge.distanceDial != null)
+                    bridge.distanceDial.SetDialValue(distance);
+                yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+
+                var appliedDistance = float.NaN;
+                try { appliedDistance = bridge.Distance; } catch { }
+                if (float.IsNaN(appliedDistance) || Mathf.Abs(appliedDistance - distance) > 0.05f) {
+                    try {
+                        bridge.SetDistanceInternal(distance, true);
+                        bridge.ForceRefreshAll();
+                        appliedDistance = bridge.Distance;
+                    }
+                    catch { }
+                }
+                MelonLogger.Msg($"[FCS] card distance requested {distance:F1} applied {appliedDistance:F1}");
+                yield return FcsRuntimeClock.WaitForSeconds(0.3f);
+            }
+        }
+        else if (distanceKm.HasValue) {
+            done("distanceKm given without bearingDeg — the distance dial lives on the bearing console controls (give both)");
+            yield break;
         }
 
         if (!string.IsNullOrWhiteSpace(startGrid)) {
