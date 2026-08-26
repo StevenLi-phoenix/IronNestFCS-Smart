@@ -55,6 +55,13 @@ public class ArtilleryTask {
     public string trackEntityId = "";
     public bool trackingLost;
     public bool hasMotion;
+
+    /// <summary>
+    /// Set when the agent re-aims this task after enqueue (AdjustTaskAim). Widens the
+    /// executor's pre-aim/pre-fire/manual-wait refresh gates to static tasks so the new
+    /// point reaches the gun without execution ever waiting on the agent.
+    /// </summary>
+    public bool aimAdjusted;
     public UnityEngine.Vector3 motionOriginLocal;
     public UnityEngine.Vector3 motionVelLocalPerSec;
     public float motionT0;
@@ -62,7 +69,7 @@ public class ArtilleryTask {
     /// <summary>Human-readable moving-target summary for HUD/agent task lines ("" for static tasks).</summary>
     public string MotionSuffix(bool zh) {
         if (!hasMotion && trackEntityId.Length == 0)
-            return "";
+            return aimAdjusted ? (zh ? " · 已改瞄" : " · re-aimed") : "";
         var speedKmh = motionVelLocalPerSec.magnitude * 3.8164f * 3600f;
         var course = UnityEngine.Mathf.Atan2(motionVelLocalPerSec.x, motionVelLocalPerSec.y) * UnityEngine.Mathf.Rad2Deg;
         if (course < 0) course += 360f;

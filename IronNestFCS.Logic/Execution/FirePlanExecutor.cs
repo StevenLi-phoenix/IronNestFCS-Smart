@@ -374,8 +374,10 @@ internal sealed class FirePlanExecutor
         // Pre-aim refresh for moving targets: loading may have taken minutes, and the
         // elevation crank itself is the slowest lay. Aim the big move at the freshest
         // solution so the pre-fire correction afterwards stays a small, fast nudge.
+        // aimAdjusted: the agent may have re-aimed the task (static point) since planning —
+        // same refresh path, the motion calls below just no-op for static tasks.
         var aimElevation = plan.Elevation;
-        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion || plan.Task.aimAdjusted)
         {
             if (plan.Task.trackEntityId.Length > 0)
                 _fcs.MapTable.UpdateEntityMotion(plan.Task);
@@ -460,19 +462,22 @@ internal sealed class FirePlanExecutor
         // task.elevation tracks what was actually laid (pre-aim refresh may have moved it).
         var appliedElevation = plan.Task.elevation > 0f ? plan.Task.elevation : plan.Elevation;
         var appliedDistance = plan.Task.distance;
-        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+        if (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion || plan.Task.aimAdjusted)
         {
             // Refreshing the model and comparing is cheap; physically re-laying is not.
             // Convert the drift into predicted impact error and only touch the gun when it
             // is significant — the pre-aim solve already carries most shots to impact.
+            // An agent re-aim (aimAdjusted) is a deliberate order, not tracking drift, so it
+            // is honored down to the normal re-lay epsilon instead of the significance gate.
             if (plan.Task.trackEntityId.Length > 0)
                 _fcs.MapTable.UpdateEntityMotion(plan.Task);
             _fcs.MapTable.ApplyMotionModel(plan.Task, PreFirePrepSeconds);
             _fcs.MapTable.RefreshSolution(plan.Task);
+            var significantErrorKm = plan.Task.aimAdjusted ? TrackDistanceEpsilonKm : PreFireSignificantErrorKm;
 
             var crossErrorKm = Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, plan.Task.angel))
                                * Mathf.Deg2Rad * plan.Task.distance;
-            if (crossErrorKm > PreFireSignificantErrorKm)
+            if (crossErrorKm > significantErrorKm)
             {
                 MelonLogger.Msg(
                     $"[FCS Track] {plan.Label}: pre-fire azimuth correction {appliedAzimuth:F2}° -> {plan.Task.angel:F2}° " +
@@ -486,7 +491,7 @@ internal sealed class FirePlanExecutor
             }
 
             var rangeErrorKm = Mathf.Abs(plan.Task.distance - appliedDistance);
-            if (rangeErrorKm > PreFireSignificantErrorKm)
+            if (rangeErrorKm > significantErrorKm)
             {
                 var preFireSolve = new ElevationSolve();
                 yield return ResolveElevation(plan, preFireSolve, plan.Task.priority);
@@ -652,7 +657,7 @@ internal sealed class FirePlanExecutor
                 // geometry; elevation re-solves on the ballistic console at LOW priority (10)
                 // so live re-lay never delays planning of new tasks.
                 if (!autoFireDeadline.HasValue
-                    && (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion)
+                    && (plan.Task.trackEntityId.Length > 0 || plan.Task.hasMotion || plan.Task.aimAdjusted)
                     && FcsRuntimeClock.Now >= nextRelay)
                 {
                     nextRelay = FcsRuntimeClock.Now + TrackRelayIntervalSeconds;
