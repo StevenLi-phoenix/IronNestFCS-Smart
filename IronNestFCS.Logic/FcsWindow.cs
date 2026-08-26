@@ -141,9 +141,9 @@ public class FcsWindow
             return;
         }
 
-        // T1/T2 are FIXED position labels for the left/right gun's current task; the unique
+        // T9/T10 are FIXED position labels for the left/right gun's current task; the unique
         // task identity is the serial (#N). Marker ids are internal and never displayed.
-        var slot = side == "Left" ? "T1" : "T2";
+        var slot = side == "Left" ? "T9" : "T10";
         var elapsed = task.startedAt > 0f ? FcsRuntimeClock.Now - task.startedAt : 0f;
         label(FcsLocalization.T(
             $"{gunName}：{slot} #{task.serial} {task.bulletType.DisplayName()} · {FcsLocalization.ProgressText(task.progress)} · {elapsed:F0}秒",

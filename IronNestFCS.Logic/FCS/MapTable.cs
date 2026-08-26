@@ -308,7 +308,7 @@ public class MapTable {
     }
 
     // ---- Gun target markers ----
-    // T1/T2 are FCS-owned: T1 sits on the left gun's current aim, T2 on the right gun's.
+    // T9/T10 are FCS-owned: T9 sits on the left gun's current aim, T10 on the right gun's.
     // After the shot they STAY PUT — the resting position shows the in-flight shell's
     // planned impact point. Never parked home. T3+ belong to the player, never touched.
     public void SetGunTargetMarker(int id, Vector3? aimLocal) {
