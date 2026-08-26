@@ -383,6 +383,21 @@ public class TriggerConsole {
     }
 
     /// <summary>
+    /// Put one arming lever back to OFF, verifying from its real physical pose. Only ever used to take back an
+    /// arming this mod itself threw (the follower whose shared bearing a re-lay invalidated); it never touches the
+    /// other side, so the player keeps physical control of the lever they operate.
+    /// </summary>
+    public IEnumerator Disarm(LeftRight leftRight) {
+        var left = leftRight == LeftRight.Left;
+        yield return EnsureArmState(
+            left ? _armLeft : _armRight,
+            left ? _armLeftPose : _armRightPose,
+            false,
+            left ? "Left" : "Right");
+        LogPhysicalStates("after disarm");
+    }
+
+    /// <summary>
     /// Ensure the selected arming lever(s) are ON. This never forces the unselected lever OFF; the player retains
     /// physical control. When two sides are requested, both lever throws are started together and verified together.
     /// </summary>

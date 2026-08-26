@@ -259,6 +259,25 @@ internal sealed class TaskDispatcher
             {
                 var assignment = item.Assignment;
                 var task = assignment.Planning.Task;
+
+                // PR review fix: MaterializeCandidate yields, and the whole match/materialize loop above can span
+                // many frames. CancelPendingBySerial and TryExpireTask/SweepExpiredTasks both run in that window,
+                // and both set Progress.Failed, dequeue the task and record its result in the same frame. Admitting
+                // such a task now would revive an already-reported-dead serial onto a gun and fire it. Discard the
+                // assignment instead: no gun slot is taken, so the side stays free for the retry round requested
+                // below, and the task is deliberately left out of selectedTasks and out of the Pending reset.
+                if (task.progress == Progress.Failed)
+                {
+                    MelonLogger.Warning(
+                        $"[FCS Dispatch] #{task.serial} was cancelled/expired during materialization; discarding plan");
+
+                    // The slot this assignment would have taken is still free. Reuse the coalesced-trigger edge so
+                    // the remaining pending work gets a fresh round instead of waiting for the next external event.
+                    if (_taskQueue.Count > 0)
+                        _dispatchRequested = true;
+                    continue;
+                }
+
                 var plan = _fcs.Planner.CreatePlan(assignment.Planning, item.Candidate, commitAt);
 
                 if (!_fcs.PlanExecutor.AddPlan(plan, out var addReason))
@@ -287,6 +306,12 @@ internal sealed class TaskDispatcher
         foreach (var result in planningResults)
         {
             if (selectedTasks.Contains(result.Task))
+                continue;
+
+            // PR review fix: same race as the admission guard above. A task cancelled or expired during
+            // materialization is already Failed, already out of the queue and already in RecentTasks; writing
+            // Pending back over it would resurrect a queue-less "pending" task that no round can ever reach.
+            if (result.Task.progress == Progress.Failed)
                 continue;
 
             result.Task.progress = Progress.Pending;

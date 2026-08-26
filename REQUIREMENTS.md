@@ -393,6 +393,24 @@ acquire = 任务 priority;人工击发等待期的实时重调炮 = **10**(永�
 
 `TryPreemptForUrgent` 本身:
 
+- **【PR review 修正】进入候选筛选之前先对 urgent 任务做一次晚绑定刷新。** 抢占是在
+  `EnqueueTask` 里评估的,**早于**任何规划轮的 §6.3 刷新链,故此刻 `urgent.distance` 可能
+  仍是入队原值(未加提前量、旧射击原点)。`BallisticCalculator.MinimumCharge` 是
+  **每 5 km 一档的阶跃函数**,跨档处哪怕差几十米也会把 `requiredCharge` 算小一档,从而选出
+  **装药实际打不到目标**的 victim(其已提交装药只能打出去,不可增减)。因此在
+  `HasFreeGun` 早退守卫**之后**、`requiredCharge` 计算**之前**跑与规划轮完全同一条链
+  (三个调用都是同步的,不引入 yield、不改变本方法的 `bool` 签名):
+
+  ```csharp
+  if (urgent.trackEntityId.Length > 0)
+      _fcs.MapTable.UpdateEntityMotion(urgent);
+  _fcs.MapTable.ApplyMotionModel(urgent);
+  _fcs.MapTable.RefreshSolution(urgent);
+  ```
+
+  连带的可观测后果:诸元真的变了时会多打一行 `[FCS] #{serial} solution refreshed: …`,
+  它排在 `[FCS Plan] … preempted by urgent …` **之前**(serial 在 `EnqueueTask` 步骤 1
+  已分配,故编号已可用)。
 - 候选排除:计划为 null;victim priority ≥ urgent priority;victim 是当前共享方位
   执行者(`_current`)或已武装待发(`_fireWaitOwner`)或已观察到击发(`ShotObserved`);
   弹种不同;已装装药 < `BallisticCalculator.MinimumCharge(urgent.distance)`。
@@ -829,6 +847,26 @@ priority);存活检查(§8.0,仅 `!IsActive(plan)`)。
 
   随后 `if (Turret.LastRotationSucceeded) appliedAzimuth = task.angel;`
   失败则保持旧值(下个 3s 周期会再试)。
+- **【PR review 修正】重调成功后必须复核已武装的 follower。** 炮塔方位是共享的:
+  §5.3/§8 的 follower 机制(`TryArmReadyFollowerDuringCurrentWait` → `CanFollowerArm`)
+  是在 `|DeltaAngle(current.Azimuth, follower.Azimuth)| ≤ SameAzimuthToleranceDegrees`
+  (0.09°)成立时才提前扳下 follower 的保险的;本次重调把炮塔转到了新的 `appliedAzimuth`,
+  该前提可能已不成立,而玩家扣扳机会**同时**把 follower 那发打出去、且打偏。
+  因此在 `appliedAzimuth = plan.Task.angel;` **之后**(仍在
+  `if (Turret.LastRotationSucceeded)` 分支内)插入一次复核:
+  - 只复核**本模块自己扳下**的那一侧——执行器记一个 `_armedFollower`(在 follower 成功
+    `ArmSelected` 后置位,`BeginFireWait`/`ClearAllFireWait` 清零),**绝不**去动玩家自己
+    扳下的保险;
+  - 判据环绕安全:`Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, follower.Task.angel))
+    > SameAzimuthToleranceDegrees`(取 follower 的**任务**方位:那才是它这一发要落到的
+    方位线,静态任务下它恒等于 `follower.Azimuth`,即 `CanFollowerArm` 当初比较的值);
+  - 成立 → 打警告日志(附录 C),先清 `_armedFollower`(防同一次等待内重复解除),再取
+    `Trigger.Acquire(follower.Task.priority)` 并调 `TriggerConsole.Disarm(follower.Side)`
+    (新增的单侧 OFF 原语,按物理位姿验证,**不碰另一侧**);
+  - **follower 的计划与任务都不动**:不判失败、不释放炮位、不清 `_current`/`_next`
+    ——它只是退出这一次共享击发事件,回到自己的正常执行流,轮到它当 `_current` 时再走
+    常规 `ArmSelected` 重新武装。
+  - 解除动作之后与其它 yield 一样做完整三联存活检查。
 - **仰角**:距离差 > 0.03 km → `ResolveElevation`(**锁优先级 10**,让路给新任务规划);
   `Ok` 后**先更新 `appliedDistance = task.distance`**(即使随后因仰角差 ≤ 0.05° 不摇炮也更新);
   再在仰角差 > 0.05° 时打日志 + `SetElevation`,**实参逐字**为
@@ -924,6 +962,8 @@ plan.Failed = true;
      资格评估的任务**。
   2. `TaskDispatcher.SweepExpiredTasks()`(public,内部 1s 节流)由 `FSC.Update` 每帧调用,
      保证无规划轮时也会到期。
+- **【PR review 修正】**过期发生在物化挂起期间时,该任务的 assignment 必须在 admission 前被
+  丢弃(与 §14.3 取消同一条守卫),见 §16。
 
 ## 11. R9 炮击顺序规划(`TaskDispatcher.PlanEngagementOrder`)
 
@@ -1127,6 +1167,9 @@ plan.Failed = true;
   `RecentTasks`、不动计数器、不通知 SceneInteractor 的旁路记录路径。)
 - 同理,**§10 的过期撤销走的是同一条 `RecordTaskResult`**,故过期同样**计入**
   `FailedTaskCount` 与 `CompletedTaskCount`(这一条在旧实现里即如此,不是变更)。
+- **【PR review 修正】取消可以发生在规划轮的物化挂起期间**(`MaterializeCandidate` 自带
+  `yield`)。此时该 serial 可能已被撮合到某个炮位,**必须**在 admission 前按
+  `progress == Progress.Failed` 丢弃该 assignment,不得上炮开火;逐字守卫与三个后果见 §16。
 
 ## 15. R14 外部买卡通道(征用台)
 
@@ -1160,8 +1203,20 @@ public int     Priority    = 50;
   (不回填列表)。
 - 每轮:`WaitUntilFocused` → 日志 → `Requisition.Acquire(request.Priority)` try/finally →
   `WaitUntilFocused` → `PurchaseDeck.BuyCardById(...)`,回调里
-  `LastCardRequestResult = $"{CardId}: {结果} @{FcsRuntimeClock.Now:F0}"` + 日志。
+  `LastCardRequestResult = $"{CardId}: {结果} @{FcsRuntimeClock.Now:F0} #{++完成序号}"` + 日志。
   finally 复位 drain 标志(F9 停协程时也复位)。
+- **【PR review 修正】结果串必须带单调递增的完成序号。** 逐字格式为
+
+  ```csharp
+  LastCardRequestResult =
+      $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0} #{++_cardRequestCompletions}";
+  ```
+
+  `_cardRequestCompletions` 是协调器内的 `private int` 自增计数器。理由:仅靠 `@时间戳`
+  在**同一 `:F0` 秒内**完成的两次同卡同结果会产出**逐字相同**的串,而 §17.13 的桥只做
+  `cardResult != _lastCardResult` 的字符串不等比较,第二条回执**永远不会上报**。
+  该计数器**不由 `Reset()` 清零**——重绑后重新从 1 开始会有再造出桥已见过的串的可能。
+  桥侧不解析该串(只比较不等 + 原样透传给 agent),故追加字段是兼容变更。
 - `public string LastCardRequestResult { get; private set; } = "";`
   ——**外部只读、仅 drain 回调内部赋值**;首次请求完成前外部读到的是**空串而非 null**
   (外部轮询逻辑依赖这一点区分"尚无结果")。串格式本身也是契约,见 §17。
@@ -1385,6 +1440,35 @@ public string RequestConsoleCard(string cardId, float bearingDeg, bool hasBearin
   "deferred N pending task(s)" 日志以规划结果数计(过期任务不计入,见 §10)。
 - 左右侧重试规则表驱动(`(bit, LeftRight, GunSide)` 静态表),消除左右复制粘贴;
   行为与 baseline 完全一致。
+- **【PR review 修正】物化期间被取消/过期的任务不得进入 admission。**
+  `Planner.MaterializeCandidate` 自带 `yield`,撮合—物化循环可跨多帧;这段挂起期间
+  §14.3 `CancelPendingBySerial` 与 §10 `TryExpireTask`/`SweepExpiredTasks` 都可能跑,
+  两者都会**同帧**把任务置 `Progress.Failed`、出队并 `RecordTaskResult`。因此 admission
+  循环里、`Planner.CreatePlan` 与 `PlanExecutor.AddPlan` **之前**必须有一道守卫:
+
+  ```csharp
+  if (task.progress == Progress.Failed)
+  {
+      MelonLogger.Warning(
+          $"[FCS Dispatch] #{task.serial} was cancelled/expired during materialization; discarding plan");
+      if (_taskQueue.Count > 0)
+          _dispatchRequested = true;
+      continue;
+  }
+  ```
+
+  判据取 `progress == Progress.Failed` 而不是"是否还在队列里":取消与过期都置它,而此刻
+  任务已不在 `_taskQueue` 中。丢弃该 assignment 的三个后果都是规范:
+  1. **不调 `AddPlan`**,故该侧炮位仍空——沿用尾部既有的 coalesced-trigger 边
+     (`_dispatchRequested` → `TryDispatch()`)让剩余 pending 立刻拿到新一轮,
+     不必等下一次外部事件;
+  2. **不进 `selectedTasks`**;
+  3. 因此它会落到"未选中一律复位 Pending"的收尾循环里,**那里必须同样跳过
+     `progress == Progress.Failed` 的任务**——否则会把已出队、已进 `RecentTasks` 的死任务
+     写回 Pending,变成任何规划轮都摸不到的幽灵 pending(且 §17.16 的活跃集合语义被破坏)。
+
+  没有这道守卫时,已经向指挥官/桥宣告取消或过期的 serial 会重新上炮并开火,
+  而当时只有一条 `admitted #N was no longer present in pending queue` 警告。
 - csproj:追加 `UnityEngine.UIModule` 引用,**完整元素逐字如下**(漏 `<Private>false</Private>`
   会把该 DLL 复制到输出目录,在 MelonLoader mod 打包中是可观测差异):
 
@@ -1656,10 +1740,14 @@ BindingFlags = `Public|Instance|Static`,**无参数类型数组**),把 `Acquire`
 
 - 桥每 2 秒轮询一次,靠 **`cardResult != _lastCardResult` 这一个字符串不等式**判断"有新结果",
   才发 requisition 事件给 agent。
-- 因此 §15.2 的 `"{CardId}: {结果} @{FcsRuntimeClock.Now:F0}"` 里那个 **`@时间戳` 是承重的**:
+- 因此 §15.2 的 `"{CardId}: {结果} @{FcsRuntimeClock.Now:F0} #{n}"` 里那个 **`@时间戳` 是承重的**:
   去掉它以后,连续两次买同一张卡得到同样结果(常见,如同一张 STAR 连买两次都 `ok`)
   第二次就**永远不会上报**,agent 会一直等一个不来的回执。
   **契约:该串每次请求完成都必须与上一次不同**(时间戳/序号)。
+- **【PR review 修正】`@{:F0}` 秒级时间戳单独不足以满足上一条契约**:同一秒内完成的两次同卡
+  同结果仍会逐字相同(征用台一次购买不足 1 秒是常态)。故格式**尾部追加 `#{n}`**,
+  `n` 为协调器内的单调自增完成序号(§15.2)。桥侧无需改动:它只做字符串不等比较并原样
+  透传该串,**不解析**其中任何字段,因此这是**兼容**的格式增补。
 - **首个结果产生前必须是空串(或 null)**——桥用 `IsNullOrEmpty` 当"尚无结果";
   §15.2 已规定初值为 `""`。
 
@@ -1807,6 +1895,8 @@ foreach (var serial in _deployedTasks.Keys.Where(s => !live.ContainsKey(s)).ToLi
 - `[FCS Track] {Label}: manual-wait azimuth re-lay {旧:F2}° -> {新:F2}°`
 - `[FCS Track] {Label}: manual-wait elevation re-lay {旧:F2}° -> {新:F2}°`
   (以上四条修正日志**在 SetRotation/SetElevation 之前无条件打印**,记录目标值——§8.2)
+- `[FCS Fire] {follower.Label}: armed follower left the shared bearing after a manual-wait re-lay (azimuth delta={delta:F3}° > {tol:F2}°); disarming, task continues`
+  ——级别 **`MelonLogger.Warning`**;`tol` 即 `SameAzimuthToleranceDegrees`(【PR review 修正】§8.5)
 - `[FCS Order] priority override: {Label} (P{a}) fires before committed {Label} (P{b})`
   (`P` 前**有空格**;仅 override 分支打印——§5.3)
 - `[FCS Order] batch {executionBatchId} paired once: {first.Label} first, {second.Label} second; {reason}`
@@ -1825,6 +1915,8 @@ foreach (var serial in _deployedTasks.Keys.Where(s => !live.ContainsKey(s)).ToLi
   ——级别 **`MelonLogger.Msg`**。注意它与紧邻的过期行同为 `[FCS Dispatch]` 前缀,但过期行是
   `MelonLogger.Warning`、本行是 `Msg`,**不要**据前缀推成 Warning(级别在 MelonLoader
   控制台里以前缀与颜色可观测)。
+- `[FCS Dispatch] #{serial} was cancelled/expired during materialization; discarding plan`
+  ——级别 **`MelonLogger.Warning`**(【PR review 修正】§16)
 - `[FCS Plan] {Label}: committed C{m} still reaches {d:F2}km — requeued to fire on the actual charge`
 - `[FCS Plan] {Label}: chamber committed C{m}, target {d:F2}km out of its reach — queued chamber-clearing shot #{dump} at {r:F1}km same bearing; original requeued for fresh load`
 - `[FCS Plan] {Label}: transient dispenser failure, retry {loadRetryCount}/2 — requeued`

@@ -62,6 +62,10 @@ internal sealed class FirePlanExecutor
     // This identifies one shared physical-fire wait, not the gun that must fire. Left/right result mapping is
     // performed from physical observations after the shared trigger event.
     private FirePlan? _fireWaitOwner;
+
+    // The non-current plan whose safety WE threw as a follower of the open shared wait (never a lever the player
+    // threw). It is the only arming this executor may take back, and it is only valid for the wait it joined.
+    private FirePlan? _armedFollower;
     private int _fireWaitGeneration = -1;
     private int _fireWaitSerial;
     private int _activeFireWaitSerial;
@@ -135,6 +139,16 @@ internal sealed class FirePlanExecutor
             detail = "a gun is already free";
             return false;
         }
+
+        // PR review fix: preemption is evaluated from EnqueueTask, before the planning round's own refresh chain
+        // ever touches this task, so urgent.distance may still be the raw enqueue value - no lead, stale firing
+        // origin. MinimumCharge is a hard 5km-per-charge step function, so a range that is stale by metres across
+        // a boundary picks a victim whose committed powder cannot actually reach the target. Run the same
+        // late-binding chain the planning round uses (all three calls are synchronous) before sizing the charge.
+        if (urgent.trackEntityId.Length > 0)
+            _fcs.MapTable.UpdateEntityMotion(urgent);
+        _fcs.MapTable.ApplyMotionModel(urgent);
+        _fcs.MapTable.RefreshSolution(urgent);
 
         var requiredCharge = BallisticCalculator.MinimumCharge(urgent.distance);
         FirePlan? victim = null;
@@ -722,7 +736,17 @@ internal sealed class FirePlanExecutor
                         if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
                             yield break;
                         if (_fcs.Turret.LastRotationSucceeded)
+                        {
                             appliedAzimuth = plan.Task.angel;
+
+                            // PR review fix: the turret is shared. A follower that armed itself against the
+                            // pre-relay bearing would now put its round on the new one, outside the tolerance its
+                            // arming decision was made under. Re-validate it and take its safety back.
+                            yield return DisarmStaleFollowerAfterRelay(plan, appliedAzimuth);
+
+                            if (!ReferenceEquals(_current, plan) || !IsActive(plan) || plan.Failed)
+                                yield break;
+                        }
                     }
 
                     if (Mathf.Abs(plan.Task.distance - appliedDistance) > TrackDistanceEpsilonKm)
@@ -785,6 +809,55 @@ internal sealed class FirePlanExecutor
                 $"[FCS Plan] ready follower arms without waiting: {follower.Label}; current={current.Label}; " +
                 $"azimuth delta={delta:F3}°");
             yield return _fcs.TriggerConsole.ArmSelected(follower.Side, null);
+
+            // Remember whose safety we threw, so a later re-lay of the shared turret can take it back. Only set
+            // while this is still the same wait the eligibility check above authorized.
+            if (ReferenceEquals(_fireWaitOwner, current))
+                _armedFollower = follower;
+        }
+        finally
+        {
+            _fcs.SharedResources.Trigger.Release();
+        }
+    }
+
+    /// <summary>
+    /// PR review fix. A manual-wait re-lay turns the shared turret under an already armed follower. Re-check that
+    /// follower against the bearing the turret actually holds now and, when it no longer shares it, take its safety
+    /// back so the commander's trigger pull cannot send its round off-target. The follower's plan and task are left
+    /// untouched - not failed, not released - so it simply loses this shared trigger event and continues its own
+    /// execution flow, re-arming through the normal path when it becomes current.
+    /// </summary>
+    private IEnumerator DisarmStaleFollowerAfterRelay(FirePlan current, float appliedAzimuth)
+    {
+        var follower = _armedFollower;
+        if (follower == null
+            || ReferenceEquals(follower, current)
+            || !ReferenceEquals(_fireWaitOwner, current)
+            || !IsActive(follower)
+            || follower.Failed)
+        {
+            yield break;
+        }
+
+        // DeltaAngle for the same wrap-around reason the re-lay gate itself uses. The follower's live task bearing
+        // is what its round has to hit; for a static task it is exactly follower.Azimuth, the value the arming
+        // decision in CanFollowerArm compared.
+        var delta = Mathf.Abs(Mathf.DeltaAngle(appliedAzimuth, follower.Task.angel));
+        if (delta <= SameAzimuthToleranceDegrees)
+            yield break;
+
+        MelonLogger.Warning(
+            $"[FCS Fire] {follower.Label}: armed follower left the shared bearing after a manual-wait re-lay " +
+            $"(azimuth delta={delta:F3}° > {SameAzimuthToleranceDegrees:F2}°); disarming, task continues");
+
+        // Dropped before the console work so a second re-lay in the same wait cannot queue a duplicate disarm.
+        _armedFollower = null;
+
+        yield return _fcs.SharedResources.Trigger.Acquire(follower.Task.priority);
+        try
+        {
+            yield return _fcs.TriggerConsole.Disarm(follower.Side);
         }
         finally
         {
@@ -1016,6 +1089,7 @@ internal sealed class FirePlanExecutor
         var token = ++_fireWaitSerial;
         _activeFireWaitSerial = token;
         _fireWaitOwner = plan;
+        _armedFollower = null;
         _fireWaitGeneration = plan.Generation;
         _autoFireIssuedForWait = false;
         return token;
@@ -1036,6 +1110,7 @@ internal sealed class FirePlanExecutor
     private void ClearAllFireWait()
     {
         _fireWaitOwner = null;
+        _armedFollower = null;
         _fireWaitGeneration = -1;
         _activeFireWaitSerial = 0;
         _autoFireIssuedForWait = false;

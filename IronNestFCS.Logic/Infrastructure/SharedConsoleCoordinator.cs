@@ -31,6 +31,12 @@ internal sealed class SharedConsoleCoordinator {
     private readonly List<ConsoleCardRequest> _cardRequests = new();
     private bool _draining;
 
+    // PR review fix: monotonic completion counter appended to LastCardRequestResult. The timestamp alone is not
+    // enough - two identical outcomes for the same card inside one :F0 second produce a byte-identical string, and
+    // the bridge detects "new result" purely by string inequality, so the second one would never be reported.
+    // Deliberately not reset by Reset(): a rebind must not be able to reproduce a string the bridge already saw.
+    private int _cardRequestCompletions;
+
     public CoroutineLock Ballistic { get; } = new();
     public CoroutineLock Requisition { get; } = new();
     public CoroutineLock Trigger { get; } = new();
@@ -38,7 +44,8 @@ internal sealed class SharedConsoleCoordinator {
     /// <summary>
     /// Result of the most recently completed card request, "" until the first one finishes.
     /// External readers poll this and treat an empty string as "no result yet"; the embedded
-    /// timestamp is load bearing, it is what makes two identical outcomes distinguishable.
+    /// timestamp and completion sequence number are load bearing, they are what makes two
+    /// identical outcomes distinguishable. Format: "{CardId}: {result} @{Now:F0} #{n}".
     /// </summary>
     public string LastCardRequestResult { get; private set; } = "";
 
@@ -111,7 +118,8 @@ internal sealed class SharedConsoleCoordinator {
                         request.DistanceKm,
                         request.StartGrid,
                         result => {
-                            LastCardRequestResult = $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0}";
+                            LastCardRequestResult =
+                                $"{request.CardId}: {result} @{FcsRuntimeClock.Now:F0} #{++_cardRequestCompletions}";
                             MelonLogger.Msg($"[FCS] console card request {request.CardId} -> {result}");
                         });
                 }
