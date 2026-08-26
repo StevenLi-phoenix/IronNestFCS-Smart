@@ -81,7 +81,22 @@ public class MapTable {
         };
     }
 
+    // The player's draggable turret piece on the map table ("Player Turret Piece", the
+    // single miniature the game spawns under the Draggable Surface). Its live position is
+    // the inferred ground truth for the firing origin: wherever the commander believes the
+    // turret is. A wrong belief produces wrong solutions — by design.
+    public const string PlayerTurretPieceName = "Player Turret Piece";
+    private Transform? turretMapModel;
+
     private Vector3 GetTurretLocalOnMap() {
+        if (turretMapModel == null && mapSurface != null) {
+            turretMapModel = mapSurface.Find(PlayerTurretPieceName);
+            if (turretMapModel != null)
+                MelonLogger.Msg(
+                    $"[FCS] firing origin bound to '{PlayerTurretPieceName}' local=({turretMapModel.localPosition.x:F3},{turretMapModel.localPosition.y:F3})");
+        }
+        if (turretMapModel != null)
+            return turretMapModel.localPosition;
         if (turretLocation == null || mapSurface == null)
             return Vector3.zero;
         return mapSurface.InverseTransformPoint(turretLocation.position);
